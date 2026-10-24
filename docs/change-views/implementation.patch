@@ -1,0 +1,2350 @@
+diff --git a/nanochat/fp8.py b/nanochat/fp8.py
+index f9bf8d5..b6c4dc5 100644
+--- a/nanochat/fp8.py
++++ b/nanochat/fp8.py
+@@ -69,11 +69,41 @@ subtly different floating-point rounding paths under torch.compile, since Induct
+ generates a different graph. Numerics are bitwise identical in eager mode.
+ """
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ 
+ from nanochat.common import COMPUTE_DTYPE
+ 
++if os.environ.get("NANOCHAT_OPT_MLP_PACKED_TILES", "0") == "1":
++    from nanochat.mlp_packed_tiles import enable
++    enable()
++
++if os.environ.get("NANOCHAT_OPT_MLP_PACKED_LAYOUT", "0") == "1":
++    from nanochat.mlp_packed_layout import enable
++    enable()
++
++if os.environ.get("NANOCHAT_OPT_LT_SEARCH", "0") == "1":
++    from nanochat.lt_autotune import enable
++    enable()
++
++if os.environ.get("NANOCHAT_OPT_PERSISTENT_SCALE_SPLIT", "0") == "1":
++    from nanochat.persistent_scale_split import enable
++    enable()
++
++if os.environ.get("NANOCHAT_OPT_MAX_ROWPACK", "0") == "1":
++    from nanochat.max_rowpack import enable
++    enable()
++
++if os.environ.get("NANOCHAT_OPT_NORM_ROWPACK", "0") == "1":
++    from nanochat.norm_rowpack import enable
++    enable()
++
++if os.environ.get("NANOCHAT_OPT_SPLIT_SCALE", "0") == "1":
++    from nanochat.scalar_scale_split import enable
++    enable()
++
+ # Avoid division by zero when computing scale from an all-zeros tensor
+ EPS = 1e-12
+ 
+diff --git a/nanochat/gpt.py b/nanochat/gpt.py
+index 1e89378..a1786db 100644
+--- a/nanochat/gpt.py
++++ b/nanochat/gpt.py
+@@ -14,6 +14,7 @@ Notable features:
+ 
+ from functools import partial
+ from dataclasses import dataclass
++import os
+ 
+ import torch
+ import torch.nn as nn
+@@ -25,6 +26,11 @@ from nanochat.optim import MuonAdamW
+ # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
+ from nanochat.flash_attention import flash_attn
+ 
++ValueEmbedding = nn.Embedding
++if os.environ.get("NANOCHAT_OPT_NATIVE_VALUE_EMBEDDING", "0") == "1":
++    from nanochat.native_value_embedding import ValueEmbedding, enable
++    enable()
++
+ @dataclass
+ class GPTConfig:
+     sequence_len: int = 2048
+@@ -189,7 +195,7 @@ class GPT(nn.Module):
+         # Value embeddings (ResFormer-style): alternating layers, last layer always included
+         head_dim = config.n_embd // config.n_head
+         kv_dim = config.n_kv_head * head_dim
+-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
++        self.value_embeds = nn.ModuleDict({str(i): ValueEmbedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
+         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
+         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
+diff --git a/nanochat/lt_autotune.cpp b/nanochat/lt_autotune.cpp
+new file mode 100644
+index 0000000..b543b9b
+--- /dev/null
++++ b/nanochat/lt_autotune.cpp
+@@ -0,0 +1,341 @@
++// Native cuBLASLt selection only: no new GPU arithmetic or precision mode.
++#include <ATen/ATen.h>
++#include <ATen/Context.h>
++#include <ATen/cuda/CUDAContextLight.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAException.h>
++#include <c10/cuda/CUDAStream.h>
++#include <torch/csrc/utils/pybind.h>
++#include <pybind11/stl.h>
++#include <cublasLt.h>
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <iomanip>
++#include <iostream>
++#include <iterator>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++#include <unistd.h>
++
++namespace {
++constexpr int64_t M = 1536, N = 1536, K = 32768;
++constexpr int MaxChoices = 6;
++struct Counts {
++  std::atomic<uint64_t> matched{0}, unsupported{0}, capture{0}, cached{0},
++      tuned{0}, native{0}, dispatched{0};
++} counts;
++
++void check(cublasStatus_t status) {
++  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS,
++              "nanochat cuBLASLt error ", static_cast<int>(status));
++}
++void log(const std::string& message) {
++  const auto* rank = std::getenv("RANK");
++  std::ostringstream line;
++  line << "NANOCHAT_OPT_LT_SEARCH: rank=" << (rank ? rank : "unset")
++       << " pid=" << getpid() << " " << message << '\n';
++  std::cout << line.str() << std::flush;
++}
++struct MatmulDesc {
++  cublasLtMatmulDesc_t value = nullptr;
++  MatmulDesc() { check(cublasLtMatmulDescCreate(&value, CUBLAS_COMPUTE_32F, CUDA_R_32F)); }
++  MatmulDesc(const MatmulDesc&) = delete;
++  MatmulDesc& operator=(const MatmulDesc&) = delete;
++  ~MatmulDesc() { if (value) cublasLtMatmulDescDestroy(value); }
++  template<class T> void set(cublasLtMatmulDescAttributes_t attribute, T v) {
++    check(cublasLtMatmulDescSetAttribute(value, attribute, &v, sizeof(v)));
++  }
++};
++struct Layout {
++  cublasLtMatrixLayout_t value = nullptr;
++  Layout(cudaDataType_t type, int64_t rows, int64_t columns, int64_t ld) {
++    check(cublasLtMatrixLayoutCreate(&value, type, rows, columns, ld));
++  }
++  ~Layout() { if (value) cublasLtMatrixLayoutDestroy(value); }
++  Layout(const Layout&) = delete;
++  Layout& operator=(const Layout&) = delete;
++};
++struct Preference {
++  cublasLtMatmulPreference_t value = nullptr;
++  Preference() { check(cublasLtMatmulPreferenceCreate(&value)); }
++  void workspace(size_t bytes) {
++    check(cublasLtMatmulPreferenceSetAttribute(
++        value, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &bytes, sizeof(bytes)));
++  }
++  ~Preference() { if (value) cublasLtMatmulPreferenceDestroy(value); }
++  Preference(const Preference&) = delete;
++  Preference& operator=(const Preference&) = delete;
++};
++struct Event {
++  cudaEvent_t value = nullptr;
++  Event() { C10_CUDA_CHECK(cudaEventCreateWithFlags(&value, cudaEventDefault)); }
++  Event(const Event&) = delete;
++  Event& operator=(const Event&) = delete;
++  ~Event() { if (value) cudaEventDestroy(value); }
++};
++
++bool shape(const at::Tensor& t, at::ScalarType dtype,
++           int64_t rows, int64_t columns, int64_t s0, int64_t s1) {
++  return t.is_cuda() && t.layout() == at::kStrided && t.scalar_type() == dtype &&
++      t.dim() == 2 && t.size(0) == rows && t.size(1) == columns &&
++      t.stride(0) == s0 && t.stride(1) == s1 && !t.is_conj() && !t.is_neg();
++}
++bool scalar(const at::Tensor& t) {
++  return t.is_cuda() && t.layout() == at::kStrided &&
++      t.scalar_type() == at::kFloat && t.dim() == 0 &&
++      !t.is_conj() && !t.is_neg();
++}
++bool disjoint(const at::Tensor& output, const at::Tensor& input) {
++  // Every supported tensor is dense. data_ptr includes its storage offset.
++  const auto o = reinterpret_cast<uintptr_t>(output.data_ptr());
++  const auto i = reinterpret_cast<uintptr_t>(input.data_ptr());
++  const auto on = static_cast<uintptr_t>(output.numel() * output.element_size());
++  const auto in = static_cast<uintptr_t>(input.numel() * input.element_size());
++  // Difference form avoids endpoint overflow.
++  return o <= i ? i - o >= on : o - i >= in;
++}
++bool tensors_ok(const at::Tensor& a, const at::Tensor& b,
++                const at::Tensor& sa, const at::Tensor& sb, const at::Tensor& out) {
++  if (!shape(a, at::kFloat8_e5m2, M, K, K, 1) ||
++      !shape(b, at::kFloat8_e4m3fn, K, N, 1, K) ||
++      !shape(out, at::kBFloat16, M, N, N, 1) || !scalar(sa) || !scalar(sb))
++    return false;
++  for (const auto* t : {&b, &sa, &sb, &out})
++    if (t->device() != a.device()) return false;
++  for (const auto* t : {&a, &b, &out})
++    if (reinterpret_cast<uintptr_t>(t->data_ptr()) % 256) return false;
++  for (const auto* t : {&sa, &sb})
++    if (reinterpret_cast<uintptr_t>(t->data_ptr()) % alignof(float)) return false;
++  for (const auto* t : {&a, &b, &sa, &sb})
++    if (!disjoint(out, *t)) return false;
++  return true;
++}
++
++struct Attributes {
++  uint32_t id = 0, split = 0, reduction = 0;
++  uint64_t flags = 0;
++  std::array<uint32_t, 4> alignment{};
++  // cuBLASLt permits serialization of this opaque descriptor within the same
++  // library version. This copy is for audit logging only, never selection.
++  std::array<unsigned char, sizeof(cublasLtMatmulAlgo_t)> raw{};
++};
++template<class T> bool config_attr(const cublasLtMatmulAlgo_t& algo,
++                                  cublasLtMatmulAlgoConfigAttributes_t name, T& value) {
++  size_t written = 0;
++  return cublasLtMatmulAlgoConfigGetAttribute(
++      &algo, name, &value, sizeof(value), &written) == CUBLAS_STATUS_SUCCESS &&
++      written == sizeof(value);
++}
++template<class T> bool cap_attr(const cublasLtMatmulAlgo_t& algo,
++                               cublasLtMatmulAlgoCapAttributes_t name, T& value) {
++  size_t written = 0;
++  return cublasLtMatmulAlgoCapGetAttribute(
++      &algo, name, &value, sizeof(value), &written) == CUBLAS_STATUS_SUCCESS &&
++      written == sizeof(value);
++}
++bool attributes(const cublasLtMatmulAlgo_t& algo, Attributes& info) {
++  std::memcpy(info.raw.data(), &algo, info.raw.size());
++  if (!config_attr(algo, CUBLASLT_ALGO_CONFIG_ID, info.id) ||
++      !config_attr(algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, info.split) ||
++      !config_attr(algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, info.reduction) ||
++      !cap_attr(algo, CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS, info.flags))
++    return false;
++  const cublasLtMatmulAlgoCapAttributes_t names[] = {
++      CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_A_BYTES, CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_B_BYTES,
++      CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_C_BYTES, CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_D_BYTES};
++  for (size_t i = 0; i < 4; ++i)
++    if (!cap_attr(algo, names[i], info.alignment[i])) return false;
++  return true;
++}
++bool precision_ok(const Attributes& info) {
++  if (info.split > 1 ||
++      (info.flags & CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_TYPE_MASK) !=
++          CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_32F)
++    return false;
++  // Pointers and all leading dimensions in bytes are multiples of 256.
++  for (auto alignment : info.alignment)
++    if (!alignment || alignment > 256 || 256 % alignment) return false;
++  return true;
++}
++std::string describe(const Attributes& a) {
++  std::ostringstream s;
++  s << "{\"id\":" << a.id << ",\"split\":" << a.split
++    << ",\"reduction\":" << a.reduction << ",\"flags\":" << a.flags
++    << ",\"alignment\":[" << a.alignment[0] << "," << a.alignment[1]
++    << "," << a.alignment[2] << "," << a.alignment[3] << "],\"algorithm_hex\":\"";
++  for (auto byte : a.raw)
++    s << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(byte);
++  s << "\"}";
++  return s.str();
++}
++
++struct Key {
++  int device;
++  std::array<char, 16> uuid;
++  size_t library_version, workspace;
++  bool operator==(const Key& other) const {
++    return device == other.device && uuid == other.uuid &&
++        library_version == other.library_version && workspace == other.workspace;
++  }
++  // Fixed shape/strides/dtypes/scalar modes/fast-accum/alignment are implicit
++  // in this source-bound ABI and are checked on every call.
++};
++struct Entry {
++  Key key;
++  bool optimized = false;
++  cublasLtMatmulAlgo_t algo{};
++};
++thread_local std::vector<Entry> cache;
++
++bool run(const at::Tensor& a, const at::Tensor& b, const at::Tensor& sa,
++         const at::Tensor& sb, const at::Tensor& out) {
++  if (!tensors_ok(a, b, sa, sb, out)) { ++counts.unsupported; return false; }
++  ++counts.matched;
++  c10::cuda::CUDAGuard guard(a.device());
++  const auto stream = c10::cuda::getCurrentCUDAStream();
++  cudaStreamCaptureStatus capture;
++  C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
++  if (capture != cudaStreamCaptureStatusNone) { ++counts.capture; return false; }
++  if (at::globalContext()._SMCarveout_EXPERIMENTAL().has_value()) {
++    ++counts.unsupported; return false;
++  }
++  const auto* props = at::cuda::getCurrentDeviceProperties();
++  if (props->major != 9 || props->minor != 0 || props->multiProcessorCount != 78) {
++    ++counts.unsupported; return false;
++  }
++  Key key{a.get_device(), {}, cublasLtGetVersion(), at::cuda::getCUDABlasLtWorkspaceSize()};
++  std::memcpy(key.uuid.data(), props->uuid.bytes, key.uuid.size());
++  auto entry = std::find_if(cache.begin(), cache.end(), [&](const Entry& e) { return e.key == key; });
++  if (entry != cache.end()) {
++    ++counts.cached;
++    if (!entry->optimized) { ++counts.native; return false; }
++  }
++
++  auto handle = at::cuda::getCurrentCUDABlasLtHandle();
++  auto* workspace = at::cuda::getCUDABlasLtWorkspace();
++  MatmulDesc desc;
++  desc.set(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
++  desc.set(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
++  // Native cublasCommonArgs computes row-major output as B.T @ A.T.
++  // Swap operands and scalar pointers, retaining column-major descriptors.
++  desc.set(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, sb.data_ptr());
++  desc.set(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, sa.data_ptr());
++  desc.set(CUBLASLT_MATMUL_DESC_FAST_ACCUM, int8_t{0});
++  desc.set(CUBLASLT_MATMUL_DESC_A_SCALE_MODE, CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F);
++  desc.set(CUBLASLT_MATMUL_DESC_B_SCALE_MODE, CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F);
++  Layout ad(CUDA_R_8F_E4M3, K, N, K), bd(CUDA_R_8F_E5M2, K, M, K);
++  Layout cd(CUDA_R_16BF, N, M, N), dd(CUDA_R_16BF, N, M, N);
++  const float alpha = 1.0f, beta = 0.0f;
++  auto launch = [&](const cublasLtMatmulAlgo_t& algorithm) {
++    // Never convert a CUDA/library execution failure into a native fallback.
++    check(cublasLtMatmul(handle, desc.value, &alpha, b.data_ptr(), ad.value,
++                        a.data_ptr(), bd.value, &beta, nullptr, cd.value,
++                        out.data_ptr(), dd.value, &algorithm,
++                        workspace, key.workspace, stream));
++  };
++  if (entry == cache.end()) {
++    Entry selected{key};
++    auto native = [&](const std::string& reason) {
++      log("native fallback: " + reason);
++      cache.push_back(selected);
++      ++counts.native;
++      return false;
++    };
++    Preference pref;
++    pref.workspace(key.workspace);
++    cublasLtMatmulHeuristicResult_t baseline{};
++    int returned = 0;
++    auto status = cublasLtMatmulAlgoGetHeuristic(
++        handle, desc.value, ad.value, bd.value, cd.value, dd.value,
++        pref.value, 1, &baseline, &returned);
++    if (status != CUBLAS_STATUS_SUCCESS || returned != 1 ||
++        baseline.state != CUBLAS_STATUS_SUCCESS) return native("baseline heuristic unavailable");
++    Attributes base_info;
++    if (!attributes(baseline.algo, base_info)) return native("baseline attributes unknown");
++    log("baseline " + describe(base_info) + " workspace=" + std::to_string(key.workspace) +
++        " library=" + std::to_string(key.library_version));
++    if (!precision_ok(base_info)) return native("baseline outside unsplit FP32 contract");
++    auto legal = [&](const cublasLtMatmulAlgo_t& algo) {
++      cublasLtMatmulHeuristicResult_t checked{};
++      return cublasLtMatmulAlgoCheck(handle, desc.value, ad.value, bd.value,
++          cd.value, dd.value, &algo, &checked) == CUBLAS_STATUS_SUCCESS &&
++          checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= key.workspace;
++    };
++    if (!legal(baseline.algo)) return native("baseline AlgoCheck unavailable");
++    std::vector<cublasLtMatmulAlgo_t> choices{baseline.algo};
++    std::vector<Attributes> infos{base_info};
++    std::array<cublasLtMatmulHeuristicResult_t, MaxChoices> proposed{};
++    returned = 0;
++    status = cublasLtMatmulAlgoGetHeuristic(
++        handle, desc.value, ad.value, bd.value, cd.value, dd.value,
++        pref.value, MaxChoices, proposed.data(), &returned);
++    if (status != CUBLAS_STATUS_SUCCESS) return native("alternative heuristics unavailable");
++    TORCH_CHECK(returned >= 0 && returned <= MaxChoices, "invalid heuristic count");
++    for (int i = 0; i < returned && choices.size() < MaxChoices; ++i) {
++      const auto& candidate = proposed[i];
++      if (candidate.state != CUBLAS_STATUS_SUCCESS) continue;
++      Attributes info;
++      if (!attributes(candidate.algo, info)) { log("reject unknown attributes"); continue; }
++      log("proposed " + describe(info));
++      if (!precision_ok(info) || info.flags != base_info.flags ||
++          info.reduction != base_info.reduction || !legal(candidate.algo)) {
++        log("reject precision/alignment/AlgoCheck"); continue;
++      }
++      if (std::any_of(choices.begin(), choices.end(), [&](const auto& old) {
++            return std::memcmp(&old, &candidate.algo, sizeof(old)) == 0;
++          })) continue;
++      choices.push_back(candidate.algo);
++      infos.push_back(info);
++    }
++    if (choices.size() < 2) return native("no distinct legal alternatives");
++    ++counts.tuned;
++    Event start, finish;
++    std::vector<float> times;
++    for (size_t i = 0; i < choices.size(); ++i) {
++      launch(choices[i]);  // Warm the library kernel before measuring it.
++      C10_CUDA_CHECK(cudaEventRecord(start.value, stream));
++      for (int repeat = 0; repeat < 3; ++repeat) launch(choices[i]);
++      C10_CUDA_CHECK(cudaEventRecord(finish.value, stream));
++      C10_CUDA_CHECK(cudaEventSynchronize(finish.value));
++      float elapsed = 0.0f;
++      C10_CUDA_CHECK(cudaEventElapsedTime(&elapsed, start.value, finish.value));
++      TORCH_CHECK(std::isfinite(elapsed) && elapsed > 0.0f, "invalid Lt timing result");
++      times.push_back(elapsed / 3.0f);
++      log("measured " + describe(infos[i]) + " index=" + std::to_string(i) +
++          " ms=" + std::to_string(times.back()));
++    }
++    auto best = static_cast<size_t>(std::min_element(times.begin(), times.end()) - times.begin());
++    // Require an isolated-kernel margin before changing the native algorithm.
++    if (best == 0 || times[best] >= 0.98f * times[0]) return native("no two-percent tuning margin");
++    selected.optimized = true;
++    selected.algo = choices[best];
++    log("selected " + describe(infos[best]) + " index=" + std::to_string(best) +
++        " baseline_ms=" + std::to_string(times[0]) +
++        " selected_ms=" + std::to_string(times[best]));
++    cache.push_back(selected);
++    entry = std::prev(cache.end());
++  }
++  // Restore the chosen result after all tuning writes; inputs never overlap out.
++  launch(entry->algo);
++  ++counts.dispatched;
++  return true;
++}
++std::map<std::string, uint64_t> counters() {
++  return {{"matched", counts.matched.load()}, {"unsupported", counts.unsupported.load()},
++          {"capture", counts.capture.load()}, {"cached", counts.cached.load()},
++          {"tuned", counts.tuned.load()}, {"native", counts.native.load()},
++          {"dispatched", counts.dispatched.load()}};
++}
++}  // namespace
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++  // Module initialization registers CPU bindings only. No CUDA calls here.
++  m.def("run", &run);
++  m.def("counters", &counters);
++}
+diff --git a/nanochat/lt_autotune.py b/nanochat/lt_autotune.py
+new file mode 100644
+index 0000000..b092504
+--- /dev/null
++++ b/nanochat/lt_autotune.py
+@@ -0,0 +1,149 @@
++"""Guarded native cuBLASLt algorithm selection without changing the AOT graph."""
++import atexit
++import functools
++import hashlib
++import importlib.metadata
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++
++import torch
++
++_CFLAGS = ["-O3", "-std=c++17"]
++# Only a C++ source is compiled, but with_cuda also prepares an unused NVCC
++# rule. Explicit architecture prevents that helper from initializing CUDA.
++_CUDA_CFLAGS = ["-gencode=arch=compute_90,code=sm_90"]
++
++
++def build_spec():
++    from torch.utils.cpp_extension import CUDA_HOME, get_cxx_compiler
++
++    here = Path(__file__).resolve()
++    cpp = here.with_suffix(".cpp")
++    cublas = Path(torch.__file__).resolve().parents[1] / "nvidia" / "cublas"
++    compiler = get_cxx_compiler()
++    ninja = shutil.which("ninja") or "/usr/local/bin/ninja"
++    if not os.access(ninja, os.X_OK):
++        raise RuntimeError("An existing Ninja executable is required for this CPU build")
++    info = {
++        "python_sha256": hashlib.sha256(here.read_bytes()).hexdigest(),
++        "cpp_sha256": hashlib.sha256(cpp.read_bytes()).hexdigest(),
++        "torch": torch.__version__,
++        "cuda": torch.version.cuda,
++        "cublas": importlib.metadata.version("nvidia-cublas-cu12"),
++        "cxx_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
++        "compiler": compiler,
++        "compiler_version": subprocess.check_output([compiler, "--version"], text=True),
++        "ninja": str(Path(ninja).resolve()),
++        "ninja_version": subprocess.check_output([ninja, "--version"], text=True),
++        "cuda_home": str(CUDA_HOME),
++        "cflags": _CFLAGS,
++        "cuda_cflags": _CUDA_CFLAGS,
++        "cublas_header_sha256": hashlib.sha256(
++            (cublas / "include" / "cublasLt.h").read_bytes()).hexdigest(),
++    }
++    digest = hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()
++    return digest, info, cpp, cublas
++
++
++def load_extension():
++    from torch.utils.cpp_extension import load
++
++    root = os.environ.get("NANOCHAT_OPT_LT_BUILD_DIR")
++    if not root or not Path(root).is_absolute():
++        raise RuntimeError("NANOCHAT_OPT_LT_BUILD_DIR must name an absolute build-cache directory")
++    digest, info, cpp, cublas = build_spec()
++    directory = Path(root).resolve() / digest
++    directory.mkdir(parents=True, exist_ok=True)
++    # Startup-only build, before compiler workers/training. Restore the process
++    # path even when compilation fails; no package installation is required.
++    old_path = os.environ.get("PATH")
++    os.environ["PATH"] = str(Path(info["ninja"]).parent) + os.pathsep + (old_path or "")
++    try:
++        module = load(
++            name="nanochat_lt_" + digest[:24],
++            sources=[str(cpp)],
++            extra_cflags=_CFLAGS,
++            extra_cuda_cflags=_CUDA_CFLAGS,
++            extra_include_paths=[str(cublas / "include")],
++            extra_ldflags=["-L" + str(cublas / "lib"),
++                           "-Wl,-rpath," + str(cublas / "lib"), "-lcublasLt"],
++            with_cuda=True,
++            build_directory=str(directory),
++            verbose=False,
++        )
++    finally:
++        if old_path is None:
++            os.environ.pop("PATH", None)
++        else:
++            os.environ["PATH"] = old_path
++    print("NANOCHAT_OPT_LT_SEARCH: build " + json.dumps(
++        {"rank": os.environ.get("RANK"), "pid": os.getpid(),
++         "digest": digest, "directory": str(directory), "versions": info}, sort_keys=True),
++        flush=True)
++    return module, digest
++
++
++def matches(args, kwargs):
++    if (len(args) != 4 or set(kwargs) != {"out_dtype", "use_fast_accum", "out"}
++            or kwargs["out_dtype"] is not torch.bfloat16
++            or kwargs["use_fast_accum"] is not False):
++        return False
++    tensors = (*args, kwargs["out"])
++    if any(type(t) is not torch.Tensor or not t.is_cuda for t in tensors):
++        return False
++    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
++        return False
++    a, b, sa, sb, out = tensors
++    if torch.is_inference(out) and not torch.is_inference_mode_enabled():
++        return False
++    return (a.dtype == torch.float8_e5m2 and b.dtype == torch.float8_e4m3fn
++            and sa.dtype == sb.dtype == torch.float32 and out.dtype == torch.bfloat16
++            and tuple(a.shape) == (1536, 32768) and tuple(b.shape) == (32768, 1536)
++            and tuple(out.shape) == (1536, 1536)
++            and sa.ndim == sb.ndim == 0
++            and all(t.device == a.device for t in tensors))
++
++
++def enable():
++    import torch.compiler.config as compiler_config
++    from torch._inductor import config
++    from torch._inductor.select_algorithm import ExternKernelChoice, extern_kernels
++    from torch._inductor.virtualized import V
++
++    if config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation:
++        raise RuntimeError("native Lt search supports ordinary Python JIT only")
++    original = extern_kernels._scaled_mm
++    if getattr(original, "_nanochat_lt_search", False) or original is not torch._scaled_mm:
++        raise RuntimeError("install native Lt search once over the original extern callable")
++    native, digest = load_extension()
++    compiler_config.cache_key_tag += ":nanochat-lt-search-" + digest
++    counts = {"calls": 0, "unmatched": 0, "native_fallback": 0, "dispatched": 0}
++
++    @functools.wraps(original)
++    def scaled_mm(*args, **kwargs):
++        counts["calls"] += 1
++        if not matches(args, kwargs):
++            counts["unmatched"] += 1
++            return original(*args, **kwargs)
++        if native.run(*args, kwargs["out"]):
++            torch.autograd.graph.increment_version(kwargs["out"])
++            counts["dispatched"] += 1
++            return kwargs["out"]
++        counts["native_fallback"] += 1
++        return original(*args, **kwargs)
++
++    def report():
++        print("NANOCHAT_OPT_LT_SEARCH: counters " + json.dumps(
++            {"rank": os.environ.get("RANK"), "pid": os.getpid(),
++             "python": counts, "cpp": dict(native.counters())}, sort_keys=True), flush=True)
++
++    scaled_mm._nanochat_lt_search = True
++    # Extern-choice timing caches use callable identity independently of the
++    # compiler cache tag; wraps() alone would retain the original builtin name.
++    scaled_mm.__name__ = "_scaled_mm_nanochat_lt_" + digest
++    extern_kernels._scaled_mm = scaled_mm
++    ExternKernelChoice.hash_key.cache_clear()
++    atexit.register(report)
+diff --git a/nanochat/max_rowpack.py b/nanochat/max_rowpack.py
+new file mode 100644
+index 0000000..cac200d
+--- /dev/null
++++ b/nanochat/max_rowpack.py
+@@ -0,0 +1,199 @@
++"""Pack independent row maxima; preserve the generated NaN-propagating max2."""
++import ast
++import copy
++import functools
++import hashlib
++from pathlib import Path
++
++
++# A conservative structural selector, not a replacement kernel. Only the row
++# extent is normalized. Any different indexing or arithmetic uses stock code.
++_BODY = """
++xnumel = 0
++r0_numel = 128
++R0_BLOCK: tl.constexpr = 128
++rnumel = r0_numel
++RBLOCK: tl.constexpr = R0_BLOCK
++xoffset = tl.program_id(0) * XBLOCK
++xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
++xmask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
++r0_index = tl.arange(0, R0_BLOCK)[None, :]
++r0_offset = 0
++r0_mask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
++roffset = r0_offset
++rindex = r0_index
++r0_1 = r0_index
++x0 = xindex
++tmp0 = r0_1
++tmp1 = tl.full([1, 1], 64, tl.int64)
++tmp2 = tmp0 >= tmp1
++tmp3 = tl.load(in_ptr0 + ((-64) + r0_1 + 64*x0), tmp2, other=0.0).to(tl.float32)
++tmp4 = 0.0
++tmp5 = tl.where(tmp2, tmp3, tmp4)
++tmp6 = tmp0 < tmp1
++tmp7 = tl.load(in_ptr1 + (r0_1 + 64*x0), tmp6, other=0.0).to(tl.float32)
++tmp8 = tl.where(tmp6, tmp7, tmp4)
++tmp9 = tmp5 + tmp8
++tmp10 = tmp9.to(tl.float32)
++tmp11 = tl_math.abs(tmp10)
++tmp12 = tl.broadcast_to(tmp11, [XBLOCK, R0_BLOCK])
++tmp14 = triton_helpers.max2(tmp12, 1)[:, None].to(tl.float32)
++tl.store(out_ptr0 + (x0), tmp14, None)
++"""
++_BODY_AST = ast.dump(ast.parse(_BODY))
++_SIGNATURE = {'in_ptr0': '*bf16', 'in_ptr1': '*bf16',
++              'out_ptr0': '*fp32', 'xnumel': 'i32', 'r0_numel': 'i32',
++              'XBLOCK': 'constexpr'}
++
++
++def _mapping(node):
++    if not isinstance(node, ast.Dict):
++        raise ValueError('expected literal dictionary')
++    keys = [ast.literal_eval(k) for k in node.keys]
++    if any(type(k) is not str for k in keys) or len(set(keys)) != len(keys):
++        raise ValueError('expected unique string keys')
++    return dict(zip(keys, node.values))
++
++
++def _metadata_ok(meta):
++    return (meta.get('grid_type') == 'Grid1D'
++            and meta.get('no_x_dim') in (None, False)
++            and meta.get('num_load') == 2 and meta.get('num_reduction') == 1
++            and meta.get('mutated_arg_names') == []
++            and not meta.get('autotune_hints')
++            and not meta.get('coordinate_descent_tuning')
++            and not meta.get('tma_min_block_sizes')
++            and not meta.get('profile_bandwidth'))
++
++
++def rewrite(source, kernel_name):
++    """Change only the decorator of the proven independent-row kernel."""
++    if 'triton_heuristics.persistent_reduction' not in source:
++        return source, False
++    try:
++        tree = ast.parse(source)
++        funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
++        if len(funcs) != 1 or funcs[0].name != kernel_name:
++            return source, False
++        fn = funcs[0]
++        if (len(fn.decorator_list) != 2
++                or ast.unparse(fn.decorator_list[1]) != 'triton.jit'):
++            return source, False
++        dec = fn.decorator_list[0]
++        if (not isinstance(dec, ast.Call) or dec.args
++                or ast.unparse(dec.func) != 'triton_heuristics.persistent_reduction'):
++            return source, False
++        kw = {k.arg: k.value for k in dec.keywords}
++        if len(kw) != len(dec.keywords) or set(kw) != {
++            'size_hints', 'reduction_hint', 'filename', 'triton_meta', 'inductor_meta'
++        }:
++            return source, False
++        if ast.unparse(kw['reduction_hint']) != 'ReductionHint.INNER':
++            return source, False
++        hints = ast.literal_eval(kw['size_hints'])
++        if (set(hints) != {'x', 'r0_'} or hints['r0_'] != 128
++                or type(hints['x']) is not int or hints['x'] < 8):
++            return source, False
++        meta = ast.literal_eval(kw['inductor_meta'])
++        if not _metadata_ok(meta):
++            return source, False
++        tm = _mapping(kw['triton_meta'])
++        if (set(tm) != {'signature', 'device', 'constants', 'configs'}
++                or ast.literal_eval(tm['signature']) != _SIGNATURE
++                or ast.literal_eval(tm['constants'])):
++            return source, False
++        device = tm['device']
++        if (not isinstance(device, ast.Call) or device.args
++                or ast.unparse(device.func) != 'DeviceProperties'):
++            return source, False
++        props = {k.arg: ast.literal_eval(k.value) for k in device.keywords}
++        if props.get('type') != 'cuda' or props.get('cc') != 90 or props.get('warp_size') != 32:
++            return source, False
++        expected_args = ast.parse('def f(in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr): pass').body[0].args
++        if ast.dump(fn.args) != ast.dump(expected_args):
++            return source, False
++        body = copy.deepcopy(fn.body)
++        if not (isinstance(body[0], ast.Assign) and len(body[0].targets) == 1
++                and ast.unparse(body[0].targets[0]) == 'xnumel'):
++            return source, False
++        rows = ast.literal_eval(body[0].value)
++        if type(rows) is not int or rows <= 0 or rows % 8 or rows > hints['x']:
++            return source, False
++        body[0].value = ast.Constant(0)
++        if ast.dump(ast.Module(body=body, type_ignores=[])) != _BODY_AST:
++            return source, False
++        from torch._inductor import config
++        if config.autotune_lookup_table:
++            return source, False
++        # Preserve every byte of the body and every original decorator argument.
++        lines = source.splitlines(keepends=True)
++        node = dec.func
++        begin = sum(map(len, lines[:node.lineno - 1])) + node.col_offset
++        end = sum(map(len, lines[:node.end_lineno - 1])) + node.end_col_offset
++        replacement = 'nanochat_max_rowpack.persistent_reduction'
++        rewritten = source[:begin] + replacement + source[end:]
++        version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++        prefix = (f'# nanochat_max_rowpack_source={version}\n'
++                  'from nanochat import max_rowpack as nanochat_max_rowpack\n')
++        return prefix + rewritten, True
++    except (SyntaxError, ValueError, TypeError, KeyError, IndexError):
++        return source, False
++
++
++def persistent_reduction(size_hints, reduction_hint=False, triton_meta=None,
++                         filename=None, inductor_meta=None):
++    from torch._inductor import config
++    from torch._inductor.runtime import triton_heuristics as h
++    from torch._inductor.runtime.hints import ReductionHint
++    import triton
++
++    meta = {} if inductor_meta is None else dict(inductor_meta)
++    meta['reduction_hint'] = reduction_hint
++    configs = h._persistent_reduction_configs(size_hints, reduction_hint, meta)
++    baseline = triton.Config({'XBLOCK': 1}, num_warps=2, num_stages=1)
++    baseline.dynamic_scale_rblock = True
++    if (not _metadata_ok(meta) or config.autotune_lookup_table
++            or reduction_hint != ReductionHint.INNER
++            or len(configs) != 1 or configs[0].__dict__ != baseline.__dict__):
++        print('NANOCHAT_OPT_MAX_ROWPACK: stock configuration fallback', flush=True)
++        return h.persistent_reduction(size_hints, reduction_hint, triton_meta,
++                                      filename, inductor_meta)
++    packed = copy.deepcopy(configs[0])
++    # Triton Config.__setstate__ omits dynamically attached fields on deepcopy.
++    packed.__dict__ = copy.deepcopy(configs[0].__dict__)
++    packed.kwargs['XBLOCK'] = 8
++    packed.num_warps = 4
++    print(f'NANOCHAT_OPT_MAX_ROWPACK: {meta.get("kernel_name")} XBLOCK=8 warps=4', flush=True)
++    return h.cached_autotune(size_hints, [packed], triton_meta=triton_meta,
++                            inductor_meta=meta, filename=filename,
++                            heuristic_type=h.HeuristicType.PERSISTENT_REDUCTION)
++
++
++def enable():
++    import torch.compiler.config as compiler_config
++    from torch._inductor import config
++    from torch._inductor.async_compile import AsyncCompile
++    from torch._inductor.virtualized import V
++
++    def supported():
++        if config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation:
++            raise RuntimeError('max row packing supports ordinary Python JIT only')
++
++    supported()
++    original = AsyncCompile.triton
++    if getattr(original, '_nanochat_split_scale', False):
++        raise RuntimeError('install max row packing before scale splitting')
++    if getattr(original, '_nanochat_max_rowpack', False):
++        raise RuntimeError('install max row packing only once')
++    compiler_config.cache_key_tag += ':nanochat-max-rowpack-' + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++
++    @functools.wraps(original)
++    def compile_triton(self, kernel_name, source_code, device_str='cuda'):
++        supported()
++        rewritten, matched = rewrite(source_code, kernel_name) if device_str == 'cuda' else (source_code, False)
++        if matched:
++            print(f'NANOCHAT_OPT_MAX_ROWPACK: rewrite {kernel_name}', flush=True)
++        return original(self, kernel_name, rewritten, device_str)
++
++    compile_triton._nanochat_max_rowpack = True
++    AsyncCompile.triton = compile_triton
+diff --git a/nanochat/mlp_packed_layout.py b/nanochat/mlp_packed_layout.py
+new file mode 100644
+index 0000000..d1c0a66
+--- /dev/null
++++ b/nanochat/mlp_packed_layout.py
+@@ -0,0 +1,206 @@
++"""Pair the two BF16 operands for one possible shared layout conversion.
++
++Transport raw bits in uint32, then retain native BF16-to-FP32 conversions.
++All arithmetic, factory results, launch settings and stores stay unchanged.
++"""
++import ast
++import copy
++import functools
++import hashlib
++import json
++import os
++from pathlib import Path
++
++from nanochat.scalar_scale_split import _fields
++
++# Complete post-split source contract. Only name, rank and backend hash vary.
++_EXPECTED = r"""
++import triton
++import triton.language as tl
++from torch._inductor.runtime import triton_helpers, triton_heuristics
++from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
++from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
++triton_helpers.set_driver_to_gpu()
++
++@triton_heuristics.pointwise(size_hints={'y': 32768, 'x': 8192}, tile_hint=TileHint.DEFAULT, filename=__file__, triton_meta={'signature': {'in_ptr0': '*bf16', 'in_ptr1': '*fp32', 'in_ptr2': '*bf16', 'in_ptr3': '*fp32', 'out_ptr0': '*fp8e4nv', 'out_ptr1': '*fp8e5', 'out_ptr2': '*fp8e5', 'ynumel': 'i32', 'xnumel': 'i32', '_nanochat_scale_input': '*fp32', 'YBLOCK': 'constexpr', 'XBLOCK': 'constexpr'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=78, cc=90, major=9, regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048, warp_size=32), 'constants': {}, 'configs': [{(0,): [['tt.divisibility', 16]], (1,): [['tt.divisibility', 16]], (2,): [['tt.divisibility', 16]], (3,): [['tt.divisibility', 16]], (4,): [['tt.divisibility', 16]], (5,): [['tt.divisibility', 16]], (6,): [['tt.divisibility', 16]], (7,): [['tt.divisibility', 16]], (8,): [['tt.divisibility', 16]]}]}, inductor_meta={'grid_type': 'Grid2D', 'autotune_hints': set(), 'kernel_name': '_kernel', 'mutated_arg_names': [], 'optimize_mem': True, 'no_x_dim': False, 'num_load': 5, 'num_reduction': 0, 'backend_hash': '_backend', 'are_deterministic_algorithms_enabled': True, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False, 'tiling_scores': {'y': 805306368, 'x': 1207959552}}, min_elem_per_thread=4)
++@triton.jit
++def _kernel(in_ptr0, in_ptr1, in_ptr2, in_ptr3, out_ptr0, out_ptr1, out_ptr2, ynumel, xnumel, _nanochat_scale_input, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
++    ynumel = 32768
++    xnumel = 6144
++    yoffset = tl.program_id(1) * YBLOCK
++    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
++    ymask = tl.full([YBLOCK, XBLOCK], True, tl.int1)
++    xoffset = tl.program_id(0) * XBLOCK
++    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
++    xmask = xindex < xnumel
++    x1 = xindex
++    y0 = yindex
++    tmp0 = tl.load(in_ptr0 + (x1 + 6144 * y0), xmask, eviction_policy='evict_last').to(tl.float32)
++    tmp5 = tl.load(in_ptr1 + 0)
++    tmp6 = tl.broadcast_to(tmp5, [YBLOCK, XBLOCK])
++    tmp15 = tl.load(in_ptr2 + (x1 + 6144 * y0), xmask, eviction_policy='evict_last').to(tl.float32)
++    tmp21 = tl.load(in_ptr3 + 0)
++    tmp22 = tmp21
++    tmp1 = tl.full([1, 1], 0, tl.int32)
++    tmp2 = triton_helpers.maximum(tmp1, tmp0)
++    tmp3 = tmp2 * tmp2
++    tmp4 = tmp3.to(tl.float32)
++    tmp7 = tmp4 * tmp6
++    tmp8 = -448.0
++    tmp9 = triton_helpers.maximum(tmp7, tmp8)
++    tmp10 = 448.0
++    tmp11 = triton_helpers.minimum(tmp9, tmp10)
++    tmp12 = tmp11.to(tl.float8e4nv)
++    tmp13 = 0.0
++    tmp14 = tmp2 <= tmp13
++    tmp16 = 2.0
++    tmp17 = tmp2 * tmp16
++    tmp18 = tmp15 * tmp17
++    tmp19 = tl.where(tmp14, tmp13, tmp18)
++    tmp20 = tmp19.to(tl.float32)
++    tmp23 = tmp22.to(tl.float64)
++    tmp24 = tl.full([1, 1], 1e-12, tl.float64)
++    tmp25 = triton_helpers.maximum(tmp23, tmp24)
++    tmp26 = tl.full([1, 1], 1, tl.int32)
++    tmp27 = tmp26 / tmp25
++    tmp28 = tl.full([1, 1], 57344.0, tl.float64)
++    tmp29 = tmp27 * tmp28
++    _nanochat_singleton_tmp30 = tl.load(_nanochat_scale_input + 0)
++    tmp30 = tl.broadcast_to(_nanochat_singleton_tmp30, [YBLOCK, XBLOCK])
++    tmp31 = tmp20 * tmp30
++    tmp32 = -57344.0
++    tmp33 = triton_helpers.maximum(tmp31, tmp32)
++    tmp34 = 57344.0
++    tmp35 = triton_helpers.minimum(tmp33, tmp34)
++    tmp36 = tmp35.to(tl.float8e5)
++    tl.store(out_ptr0 + (y0 + 32768 * x1), tmp12, xmask)
++    tl.store(out_ptr1 + (x1 + 6144 * y0), tmp36, xmask)
++    tl.store(out_ptr2 + (y0 + 32768 * x1), tmp36, xmask)
++
++"""
++_EXPECTED_AST = ast.dump(ast.parse(_EXPECTED))
++
++
++def rewrite(source, kernel_name):
++    """Bundle two co-indexed BF16 loads; leave unsupported sources unchanged."""
++    # AST columns are UTF-8 byte offsets; captured sources use ASCII and LF.
++    # Reject other separators that splitlines and Python tokenize differently.
++    if (not isinstance(source, str) or not source.isascii()
++            or any(c in source for c in '\r\v\f\x1c\x1d\x1e')):
++        return source, False
++    try:
++        tree = ast.parse(source)
++        normalized = copy.deepcopy(tree)
++        functions = [n for n in normalized.body if isinstance(n, ast.FunctionDef)]
++        if len(functions) != 1 or functions[0].name != kernel_name:
++            return source, False
++        fn = functions[0]
++        fn.name = '_kernel'
++        dec = fn.decorator_list[0]
++        kw = {k.arg: k.value for k in dec.keywords}
++        if len(kw) != len(dec.keywords):
++            return source, False
++        tm = _fields(kw['triton_meta'])
++        device = tm['device']
++        props = {k.arg: ast.literal_eval(k.value) for k in device.keywords}
++        if (len(props) != len(device.keywords) or type(props.get('index')) is not int
++                or not 0 <= props['index'] < 8):
++            return source, False
++        next(k for k in device.keywords if k.arg == 'index').value = ast.Constant(0)
++        im = _fields(kw['inductor_meta'])
++        if (ast.literal_eval(im['kernel_name']) != kernel_name
++                or not isinstance(ast.literal_eval(im['backend_hash']), str)):
++            return source, False
++        im['kernel_name'].value = '_kernel'
++        im['backend_hash'].value = '_backend'
++        if ast.dump(normalized) != _EXPECTED_AST:
++            return source, False
++        from torch._inductor import config
++        if (config.autotune_lookup_table or config.coordinate_descent_tuning
++                or config.max_autotune or config.max_autotune_pointwise):
++            return source, False
++    except (SyntaxError, ValueError, TypeError, KeyError, IndexError,
++            AttributeError, StopIteration):
++        return source, False
++
++    # The complete AST guard fixes both load addresses, masks, dtypes and users.
++    # Move the second readonly load before its first consumer, pair the raw bits,
++    # and keep the same native cvt semantics for both halves (including NaNs).
++    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
++    assignments = {n.targets[0].id: n for n in fn.body
++                   if isinstance(n, ast.Assign) and len(n.targets) == 1
++                   and isinstance(n.targets[0], ast.Name)}
++    first, second = assignments['tmp0'], assignments['tmp15']
++    lines = source.splitlines(keepends=True)
++    for node in (first, second):
++        # Inserting multiline statements requires this exact body indentation.
++        # Never delete half of a semicolon-separated line or adjacent statement.
++        tail = lines[node.end_lineno - 1][node.end_col_offset:].strip()
++        if (node.col_offset != 4 or lines[node.lineno - 1][:node.col_offset] != '    '
++                or (tail and not tail.startswith('#'))):
++            return source, False
++    load_a = ast.get_source_segment(source, first.value.func.value)
++    load_b = ast.get_source_segment(source, second.value.func.value)
++    asm = ("{ .reg .b16 a, b; mov.b32 {a, b}, $2; "
++           "cvt.f32.bf16 $0, a; cvt.f32.bf16 $1, b; }")
++    replacement = (
++        '_nanochat_pair_a = ' + load_a + '.to(tl.uint16, bitcast=True).to(tl.uint32)\n'
++        '    _nanochat_pair_b = ' + load_b + '.to(tl.uint16, bitcast=True).to(tl.uint32)\n'
++        '    _nanochat_pair = _nanochat_pair_a | (_nanochat_pair_b << 16)\n'
++        '    tmp0, tmp15 = tl.inline_asm_elementwise(' + repr(asm) +
++        ', constraints="=f,=f,r", args=[_nanochat_pair], '
++        'dtype=(tl.float32, tl.float32), is_pure=True, pack=1)')
++    def span(node):
++        return (sum(map(len, lines[:node.lineno - 1])) + node.col_offset,
++                sum(map(len, lines[:node.end_lineno - 1])) + node.end_col_offset)
++    edits = [(span(first), replacement), (span(second), '')]
++    rewritten = source
++    for (begin, end), text in sorted(edits, reverse=True):
++        rewritten = rewritten[:begin] + text + rewritten[end:]
++    try:
++        ast.parse(rewritten)
++    except SyntaxError:
++        return source, False
++    version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++    return '# nanochat_mlp_packed_source=' + version + '\n' + rewritten, True
++
++
++def enable():
++    import torch.compiler.config as compiler_config
++    from torch._inductor import config
++    from torch._inductor.async_compile import AsyncCompile
++    from torch._inductor.virtualized import V
++
++    def supported():
++        if (config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation
++                or config.triton.cudagraphs or config.triton.multi_kernel
++                or config.autotune_lookup_table or config.coordinate_descent_tuning
++                or config.max_autotune or config.max_autotune_pointwise):
++            raise RuntimeError('MLP packed layout requires ordinary fixed-config Python JIT')
++
++    supported()
++    original = AsyncCompile.triton
++    if any(getattr(original, flag, False) for flag in (
++        '_nanochat_mlp_packed', '_nanochat_persistent_scale', '_nanochat_max_rowpack',
++        '_nanochat_norm_rowpack', '_nanochat_split_scale'
++    )):
++        raise RuntimeError('install MLP packed layout once, before the existing split/rowpack chain')
++    version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++    compiler_config.cache_key_tag += ':nanochat-mlp-packed-' + version
++
++    @functools.wraps(original)
++    def compile_triton(self, kernel_name, source_code, device_str='cuda'):
++        supported()
++        rewritten, matched = (rewrite(source_code, kernel_name) if device_str == 'cuda'
++                              else (source_code, False))
++        if matched:
++            print('NANOCHAT_OPT_MLP_PACKED: ' + json.dumps({
++                'rank': os.environ.get('RANK'), 'kernel': kernel_name,
++                'input': hashlib.sha256(source_code.encode()).hexdigest(),
++                'output': hashlib.sha256(rewritten.encode()).hexdigest(),
++                'helper': version
++            }, sort_keys=True), flush=True)
++        return original(self, kernel_name, rewritten, device_str)
++
++    compile_triton._nanochat_mlp_packed = True
++    AsyncCompile.triton = compile_triton
+diff --git a/nanochat/mlp_packed_tiles.py b/nanochat/mlp_packed_tiles.py
+new file mode 100644
+index 0000000..5d02e85
+--- /dev/null
++++ b/nanochat/mlp_packed_tiles.py
+@@ -0,0 +1,231 @@
++"""Bounded launch search for the unchanged accepted packed MLP kernel."""
++import ast
++import copy
++import functools
++import hashlib
++import json
++import os
++from pathlib import Path
++
++from nanochat import mlp_packed_layout as packed
++from nanochat.scalar_scale_split import _fields
++
++_PACKED_HASH = 'c08d198478dd0d8582575406fd1aa391574b941415043dc2614e50d5a9115a6f'
++_HINTS = {'y': 32768, 'x': 8192}
++_TILES = ((32, 32, 4), (64, 32, 4), (32, 64, 4),
++          (64, 64, 4), (32, 32, 8), (64, 64, 8))
++
++
++def _version():
++    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++
++
++def _emit(event, **fields):
++    print('NANOCHAT_OPT_MLP_PACKED_TILES: ' + json.dumps({
++        'event': event, 'rank': os.environ.get('RANK'), 'pid': os.getpid(),
++        **fields}, sort_keys=True), flush=True)
++
++
++def _normalized(source, kernel_name):
++    if (not isinstance(source, str) or not source.isascii()
++            or any(c in source for c in '\r\v\f\x1c\x1d\x1e')
++            or not source.startswith('# nanochat_mlp_packed_source=' + _PACKED_HASH + '\n')):
++        return None
++    try:
++        tree = copy.deepcopy(ast.parse(source))
++        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
++        if len(functions) != 1 or functions[0].name != kernel_name:
++            return None
++        fn = functions[0]
++        fn.name = '_kernel'
++        dec = fn.decorator_list[0]
++        kw = {k.arg: k.value for k in dec.keywords}
++        if len(kw) != len(dec.keywords):
++            return None
++        tm = _fields(kw['triton_meta'])
++        device = tm['device']
++        props = {k.arg: ast.literal_eval(k.value) for k in device.keywords}
++        if (len(props) != len(device.keywords) or type(props.get('index')) is not int
++                or not 0 <= props['index'] < 8):
++            return None
++        next(k for k in device.keywords if k.arg == 'index').value = ast.Constant(0)
++        im = _fields(kw['inductor_meta'])
++        if (ast.literal_eval(im['kernel_name']) != kernel_name
++                or not isinstance(ast.literal_eval(im['backend_hash']), str)):
++            return None
++        im['kernel_name'].value = '_kernel'
++        im['backend_hash'].value = '_backend'
++        return ast.dump(tree)
++    except (SyntaxError, ValueError, TypeError, KeyError, IndexError,
++            AttributeError, StopIteration):
++        return None
++
++
++def _oracle():
++    source, matched = packed.rewrite(packed._EXPECTED, '_kernel')
++    expected = _normalized(source, '_kernel')
++    if not matched or expected is None:
++        raise RuntimeError('Unable to construct packed MLP source contract')
++    return expected
++
++
++def rewrite(source, kernel_name, expected):
++    if _normalized(source, kernel_name) != expected:
++        return source, False
++    fn = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef))
++    dec = fn.decorator_list[0]
++    lines = source.splitlines(keepends=True)
++    start = sum(map(len, lines[:dec.func.lineno - 1])) + dec.func.col_offset
++    end = sum(map(len, lines[:dec.func.end_lineno - 1])) + dec.func.end_col_offset
++    last = dec.keywords[-1]
++    insert = sum(map(len, lines[:last.end_lineno - 1])) + last.end_col_offset
++    # Only the decorator changes. Preserve every byte of the executable body.
++    digest = hashlib.sha256(source.encode()).hexdigest()
++    rewritten = source[:insert] + ', source_hash=' + repr(digest) + source[insert:]
++    rewritten = rewritten[:start] + 'nanochat_mlp_packed_tiles.pointwise' + rewritten[end:]
++    try:
++        ast.parse(rewritten)
++    except SyntaxError:
++        return source, False
++    return ('# nanochat_mlp_packed_tiles_source=' + _version() + '\n'
++            'from nanochat import mlp_packed_tiles as nanochat_mlp_packed_tiles\n'
++            + rewritten), True
++
++
++def _configs(size_hints, minimum):
++    from torch._inductor.runtime import triton_heuristics as h
++    choices = []
++    for x, y, warps in _TILES:
++        c = h.triton_config(size_hints, x, y, num_elements_per_warp=x*y//warps,
++                            min_elem_per_thread=minimum)
++        if (c.kwargs != {'XBLOCK': x, 'YBLOCK': y} or c.num_warps != warps
++                or c.num_stages != 1 or c.num_ctas != 1 or c.pre_hook is not None
++                or c.maxnreg is not None or c.ir_override is not None
++                or 6144 % x or 32768 % y):
++            raise ValueError('Installed helper changed requested MLP configuration')
++        choices.append(c)
++    return choices
++
++
++def _configuration(c):
++    return dict(kwargs=dict(c.kwargs), num_warps=c.num_warps,
++                num_stages=c.num_stages, num_ctas=c.num_ctas)
++
++
++class _SelectionObserver:
++    """Picklable observation of the normal autotuner's selected launcher."""
++    def __init__(self, original, identity):
++        self.original = original
++        self.identity = identity
++
++    def __call__(self, config, time_taken_ns, **kwargs):
++        result = (self.original(config, time_taken_ns, **kwargs)
++                  if self.original is not None else None)
++        # Called after selection, before its subsequent launch; no dispatch claim.
++        _emit('selected', **self.identity, configuration=_configuration(config),
++              triton_cache_hash=kwargs.get('triton_cache_hash'),
++              precompile_and_autotune_time_ns=time_taken_ns)
++        return result
++
++
++def _metadata_ok(triton_meta, inductor_meta):
++    try:
++        fn = next(n for n in ast.parse(packed._EXPECTED).body if isinstance(n, ast.FunctionDef))
++        kw = {k.arg: k.value for k in fn.decorator_list[0].keywords}
++        expected = ast.literal_eval(kw['inductor_meta'])
++        actual = copy.deepcopy(inductor_meta)
++        if not isinstance(actual['kernel_name'], str) or not isinstance(actual['backend_hash'], str):
++            return False
++        actual['kernel_name'] = '_kernel'; actual['backend_hash'] = '_backend'
++        if actual != expected:
++            return False
++        tm = _fields(kw['triton_meta'])
++        if set(triton_meta) != set(tm):
++            return False
++        for key in ('signature', 'constants', 'configs'):
++            if triton_meta[key] != ast.literal_eval(tm[key]):
++                return False
++        device = triton_meta['device']
++        if type(device.index) is not int or not 0 <= device.index < 8:
++            return False
++        return all(getattr(device, k.arg) == ast.literal_eval(k.value)
++                   for k in tm['device'].keywords if k.arg != 'index')
++    except (KeyError, TypeError, ValueError, AttributeError):
++        return False
++
++
++def pointwise(size_hints, triton_meta, tile_hint=None, filename=None,
++              min_elem_per_thread=0, inductor_meta=None, source_hash=None):
++    from torch._inductor.runtime import triton_heuristics as h
++    from torch._inductor.runtime.hints import TileHint
++
++    def stock(reason):
++        _emit('fallback', reason=reason)
++        return h.pointwise(size_hints, triton_meta, tile_hint, filename,
++                           min_elem_per_thread, inductor_meta)
++
++    if (size_hints != _HINTS or tile_hint != TileHint.DEFAULT or min_elem_per_thread != 4
++            or not filename or not _metadata_ok(triton_meta, inductor_meta)
++            or not isinstance(source_hash, str) or len(source_hash) != 64
++            or any(c not in '0123456789abcdef' for c in source_hash)):
++        return stock('metadata')
++    try:
++        choices = _configs(size_hints, min_elem_per_thread)
++    except (ValueError, AssertionError):
++        return stock('configuration')
++    identity = dict(kernel=inductor_meta['kernel_name'], source=source_hash,
++                    helper=_version(), configurations=[_configuration(c) for c in choices])
++    decorator = h.cached_autotune(size_hints, choices,
++                                  triton_meta=copy.deepcopy(triton_meta),
++                                  inductor_meta=copy.deepcopy(inductor_meta),
++                                  filename=filename, heuristic_type=h.HeuristicType.POINTWISE)
++
++    def decorate(fn):
++        tuner = decorator(fn)
++        _emit('constructed', **identity, cache_info=tuner.autotune_cache_info,
++              remaining_configurations=[_configuration(c) for c in tuner.configs])
++        tuner.save_cache_hook = _SelectionObserver(tuner.save_cache_hook, identity)
++        return tuner
++    return decorate
++
++
++def enable():
++    import torch.compiler.config as compiler_config
++    from torch._inductor import config
++    from torch._inductor.async_compile import AsyncCompile
++    from torch._inductor.virtualized import V
++
++    def supported():
++        if (config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation
++                or config.triton.cudagraphs or config.triton.multi_kernel
++                or config.autotune_lookup_table or config.coordinate_descent_tuning
++                or config.max_autotune or config.max_autotune_pointwise
++                or os.environ.get('TRITON_INTERPRET', '0') == '1'):
++            raise RuntimeError('Packed MLP tile search requires ordinary Python JIT')
++    supported()
++    if hashlib.sha256(Path(packed.__file__).read_bytes()).hexdigest() != _PACKED_HASH:
++        raise RuntimeError('Packed MLP tile search requires the reviewed predecessor')
++    original = AsyncCompile.triton
++    if any(getattr(original, flag, False) for flag in (
++        '_nanochat_mlp_packed_tiles', '_nanochat_mlp_packed', '_nanochat_persistent_scale',
++        '_nanochat_max_rowpack', '_nanochat_norm_rowpack', '_nanochat_split_scale')):
++        raise RuntimeError('Install packed MLP tile search once, before the packed/split chain')
++    expected = _oracle()
++    version = _version()
++    compiler_config.cache_key_tag += ':nanochat-mlp-packed-tiles-' + version + '-' + _PACKED_HASH
++
++    @functools.wraps(original)
++    def compile_triton(self, kernel_name, source_code, device_str='cuda'):
++        supported()
++        rewritten, matched = (rewrite(source_code, kernel_name, expected) if device_str == 'cuda'
++                              else (source_code, False))
++        if matched:
++            _emit('rewrite', kernel=kernel_name, helper=version,
++                  input=hashlib.sha256(source_code.encode()).hexdigest(),
++                  output=hashlib.sha256(rewritten.encode()).hexdigest())
++        elif device_str == 'cuda' and isinstance(source_code, str) and source_code.startswith('# nanochat_mlp_packed_source='):
++            _emit('fallback', reason='source_contract', kernel=kernel_name)
++        return original(self, kernel_name, rewritten, device_str)
++
++    compile_triton._nanochat_mlp_packed_tiles = True
++    AsyncCompile.triton = compile_triton
+diff --git a/nanochat/native_value_embedding.py b/nanochat/native_value_embedding.py
+new file mode 100644
+index 0000000..982bfad
+--- /dev/null
++++ b/nanochat/native_value_embedding.py
+@@ -0,0 +1,177 @@
++"""Native FP32 backward accumulation for explicitly selected value embeddings.
++
++The module inherits nn.Embedding construction and weight registration. Its
++ordinary traceable autograd Function keeps lookup, promotion, padding mask and
++final BF16 conversion visible to compilation. Only native accumulation is
++opaque; the token embedding and global decomposition table are unchanged.
++"""
++import atexit
++from collections import Counter
++import hashlib
++import json
++import os
++from pathlib import Path
++
++import torch
++import torch.nn as nn
++
++_OP = None
++_COUNTS = Counter()
++
++
++def forward_reason(module, indices):
++    weight = module.weight
++    if (not module.training or not torch.is_grad_enabled()
++            or not weight.requires_grad):
++        return 'training_state'
++    if (module.padding_idx is not None or module.max_norm is not None
++            or module.scale_grad_by_freq is not False or module.sparse is not False
++            or module.num_embeddings != 32768 or module.embedding_dim != 1536):
++        return 'options'
++    if (weight.device.type != 'cuda' or indices.device != weight.device
++            or weight.layout != torch.strided or indices.layout != torch.strided):
++        return 'device_or_layout'
++    if weight.dtype != torch.bfloat16 or indices.dtype != torch.int64:
++        return 'dtype'
++    shapes = (tuple(weight.shape), tuple(indices.shape))
++    strides = (tuple(weight.stride()), tuple(indices.stride()))
++    if not all(type(x) is int for xs in (*shapes, *strides) for x in xs):
++        return 'symbolic_metadata'
++    if shapes != ((32768, 1536), (16, 2048)):
++        return 'shape'
++    if strides != ((1536, 1), (2048, 1)):
++        return 'stride'
++    # These real dtypes cannot carry a conjugate bit. ATen's functional
++    # dispatch handles logical negative-bit values; do not trace unsupported
++    # bool-returning Tensor.is_conj/is_neg methods here.
++    return None
++
++
++def accumulation_reason(grad, indices, num_weights, padding_idx):
++    if (type(num_weights) is not int or num_weights != 32768
++            or type(padding_idx) is not int or padding_idx != -1):
++        return 'arguments'
++    if (grad.device.type != 'cuda' or indices.device != grad.device
++            or grad.layout != torch.strided or indices.layout != torch.strided):
++        return 'device_or_layout'
++    if grad.dtype != torch.float32 or indices.dtype != torch.int64:
++        return 'dtype'
++    shapes = (tuple(grad.shape), tuple(indices.shape))
++    strides = (tuple(grad.stride()), tuple(indices.stride()))
++    if not all(type(x) is int for xs in (*shapes, *strides) for x in xs):
++        return 'symbolic_metadata'
++    if shapes != ((16, 2048, 1536), (16, 2048)):
++        return 'shape'
++    if strides != ((3145728, 1536, 1), (2048, 1)):
++        return 'stride'
++    return None
++
++
++class _ValueEmbeddingFunction(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, weight, indices):
++        ctx.save_for_backward(indices)
++        ctx.num_weights = weight.shape[0]
++        ctx.result_dtype = weight.dtype
++        return torch.ops.aten.embedding.default(weight, indices, -1, False, False)
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        if grad_output is None:
++            return None, None
++        (indices,) = ctx.saved_tensors
++        # Fixed BF16 module contract: upstream opmath promotes to FP32, masks
++        # padding and only rounds back to BF16 after embedding accumulation.
++        grad_output = grad_output.to(torch.float32)
++        indices = indices.to(torch.long)
++        mask = (indices == -1).unsqueeze(-1)
++        grad = grad_output.masked_fill(mask, 0)
++        return _OP(grad, indices, ctx.num_weights, -1).to(ctx.result_dtype), None
++
++
++class ValueEmbedding(nn.Embedding):
++    def forward(self, indices):
++        # No Python counters or logging in the traced forward/backward. Missing
++        # native call counts are checked against all 12 expected module roles.
++        if forward_reason(self, indices) is not None:
++            return super().forward(indices)
++        return _ValueEmbeddingFunction.apply(self.weight, indices)
++
++
++def _setup_context(ctx, inputs, output):
++    _, indices, _, padding_idx = inputs
++    ctx.save_for_backward(indices)
++    ctx.padding_idx = padding_idx
++
++
++def _backward(ctx, grad_weight):
++    if grad_weight is None:
++        return None, None, None, None
++    (indices,) = ctx.saved_tensors
++    grad = grad_weight.index_select(0, indices.reshape(-1))
++    if ctx.padding_idx >= 0:
++        grad = grad.masked_fill((indices == ctx.padding_idx).reshape(-1, 1), 0)
++    return grad.reshape(*indices.shape, grad_weight.shape[-1]), None, None, None
++
++
++def enable():
++    global _OP
++    import torch.compiler.config as compiler_config
++    import torch._decomp.decompositions as base
++    import torch.nn.functional as functional
++    import torch.nn.modules.sparse as sparse
++    from torch._inductor import config, decomposition
++    from torch._inductor.virtualized import V
++
++    if _OP is not None:
++        raise RuntimeError('install native value embedding only once')
++    if (config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation
++            or config.triton.cudagraphs):
++        raise RuntimeError('native value embedding supports ordinary Python JIT')
++    key = torch.ops.aten.embedding_dense_backward.default
++    if decomposition.decompositions.get(key) is not decomposition._embedding_dense_backward:
++        raise RuntimeError('native value embedding requires the original global decomposition')
++    for module, digest in {
++        base: '4061f0dd317b66822c2a324824110063cc262635e44ae7996f84538ce4f4d463',
++        decomposition: 'ba6ec417bac0b61d5617f3ee44f64c098cb3e0ac24edd8580d4d4384e2d30bdc',
++        sparse: '9efa8d236f5b29c42ffb2ed2822c01d8b255c54bb5853a8f919e70c06d101fab',
++        functional: '5e96bb0880a4c6f4c0ae34c00a894e152412e68f6ffd073d2b442907eedeb5fa',
++    }.items():
++        if hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() != digest:
++            raise RuntimeError('native value embedding requires reviewed Torch sources')
++
++    @torch.library.custom_op('nanochat::value_embedding_accumulate_fp32',
++                             mutates_args=(), device_types='cuda')
++    def accumulate(grad: torch.Tensor, indices: torch.Tensor,
++                   num_weights: int, padding_idx: int) -> torch.Tensor:
++        reason = accumulation_reason(grad, indices, num_weights, padding_idx)
++        if reason is not None:
++            raise RuntimeError('unexpected native value embedding input: ' + reason)
++        _COUNTS['native_calls'] += 1
++        return torch.ops.aten.embedding_dense_backward.default(
++            grad, indices, num_weights, padding_idx, False)
++
++    @accumulate.register_fake
++    def fake(grad, indices, num_weights, padding_idx):
++        reason = accumulation_reason(grad, indices, num_weights, padding_idx)
++        if reason is not None:
++            raise RuntimeError('unexpected fake value embedding input: ' + reason)
++        return grad.new_empty((num_weights, grad.shape[-1]))
++
++    accumulate.register_autograd(_backward, setup_context=_setup_context)
++    _OP = accumulate
++    version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++    compiler_config.cache_key_tag += ':nanochat-native-value-embedding-' + version
++    print('NANOCHAT_OPT_NATIVE_VALUE: installed ' + json.dumps({
++        'rank': os.environ.get('RANK'), 'pid': os.getpid(), 'helper': version,
++        'scope': 'GPT.value_embeds only', 'input_dtype': 'bfloat16',
++        'accumulation_dtype': 'float32', 'output_dtype': 'bfloat16',
++        'cache_key_tag': compiler_config.cache_key_tag,
++    }, sort_keys=True), flush=True)
++
++    def report():
++        print('NANOCHAT_OPT_NATIVE_VALUE: counters ' + json.dumps({
++            'rank': os.environ.get('RANK'), 'pid': os.getpid(),
++            'helper': version, 'counts': dict(_COUNTS),
++        }, sort_keys=True), flush=True)
++    atexit.register(report)
+diff --git a/nanochat/norm_rowpack.py b/nanochat/norm_rowpack.py
+new file mode 100644
+index 0000000..0e8d5cb
+--- /dev/null
++++ b/nanochat/norm_rowpack.py
+@@ -0,0 +1,196 @@
++"""Pack independent RMS backward dot-product rows; leave arithmetic intact."""
++import ast
++import copy
++import functools
++import hashlib
++from pathlib import Path
++
++
++# A conservative structural selector, not a replacement kernel. Only the row
++# extent is normalized. Any different indexing or arithmetic uses stock code.
++_BODY = """
++xnumel = 0
++r0_numel = 128
++R0_BLOCK: tl.constexpr = 128
++rnumel = r0_numel
++RBLOCK: tl.constexpr = R0_BLOCK
++xoffset = tl.program_id(0) * XBLOCK
++xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
++xmask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
++r0_index = tl.arange(0, R0_BLOCK)[None, :]
++r0_offset = 0
++r0_mask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
++roffset = r0_offset
++rindex = r0_index
++r0_1 = r0_index
++x0 = xindex
++tmp0 = tl.load(in_ptr0 + (r0_1 + 128*x0), None).to(tl.float32)
++tmp2 = tl.load(in_ptr1 + (x0), None, eviction_policy='evict_last')
++tmp4 = tl.load(in_ptr2 + (r0_1 + 128*x0), None).to(tl.float32)
++tmp1 = tmp0.to(tl.float32)
++tmp3 = tmp1 * tmp2
++tmp5 = 1.2
++tmp6 = tmp4 * tmp5
++tmp7 = tmp6.to(tl.float32)
++tmp8 = tmp3 * tmp7
++tmp9 = tl.broadcast_to(tmp8, [XBLOCK, R0_BLOCK])
++tmp11 = tl.sum(tmp9, 1)[:, None].to(tl.float32)
++tl.store(out_ptr0 + (x0), tmp11, None)
++"""
++_BODY_AST = ast.dump(ast.parse(_BODY))
++_SIGNATURE = {'in_ptr0': '*bf16', 'in_ptr1': '*fp32', 'in_ptr2': '*bf16',
++              'out_ptr0': '*fp32', 'xnumel': 'i32', 'r0_numel': 'i32',
++              'XBLOCK': 'constexpr'}
++
++
++def _mapping(node):
++    if not isinstance(node, ast.Dict):
++        raise ValueError('expected literal dictionary')
++    keys = [ast.literal_eval(k) for k in node.keys]
++    if any(type(k) is not str for k in keys) or len(set(keys)) != len(keys):
++        raise ValueError('expected unique string keys')
++    return dict(zip(keys, node.values))
++
++
++def _metadata_ok(meta):
++    return (meta.get('grid_type') == 'Grid1D'
++            and meta.get('no_x_dim') in (None, False)
++            and meta.get('num_load') == 3 and meta.get('num_reduction') == 1
++            and meta.get('mutated_arg_names') == []
++            and not meta.get('autotune_hints')
++            and not meta.get('coordinate_descent_tuning')
++            and not meta.get('tma_min_block_sizes')
++            and not meta.get('profile_bandwidth'))
++
++
++def rewrite(source, kernel_name):
++    """Change only the decorator of the proven independent-row kernel."""
++    if 'triton_heuristics.persistent_reduction' not in source:
++        return source, False
++    try:
++        tree = ast.parse(source)
++        funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
++        if len(funcs) != 1 or funcs[0].name != kernel_name:
++            return source, False
++        fn = funcs[0]
++        if (len(fn.decorator_list) != 2
++                or ast.unparse(fn.decorator_list[1]) != 'triton.jit'):
++            return source, False
++        dec = fn.decorator_list[0]
++        if (not isinstance(dec, ast.Call) or dec.args
++                or ast.unparse(dec.func) != 'triton_heuristics.persistent_reduction'):
++            return source, False
++        kw = {k.arg: k.value for k in dec.keywords}
++        if len(kw) != len(dec.keywords) or set(kw) != {
++            'size_hints', 'reduction_hint', 'filename', 'triton_meta', 'inductor_meta'
++        }:
++            return source, False
++        if ast.unparse(kw['reduction_hint']) != 'ReductionHint.INNER':
++            return source, False
++        hints = ast.literal_eval(kw['size_hints'])
++        if (set(hints) != {'x', 'r0_'} or hints['r0_'] != 128
++                or type(hints['x']) is not int or hints['x'] < 4):
++            return source, False
++        meta = ast.literal_eval(kw['inductor_meta'])
++        if not _metadata_ok(meta):
++            return source, False
++        tm = _mapping(kw['triton_meta'])
++        if (set(tm) != {'signature', 'device', 'constants', 'configs'}
++                or ast.literal_eval(tm['signature']) != _SIGNATURE
++                or ast.literal_eval(tm['constants'])):
++            return source, False
++        device = tm['device']
++        if (not isinstance(device, ast.Call) or device.args
++                or ast.unparse(device.func) != 'DeviceProperties'):
++            return source, False
++        props = {k.arg: ast.literal_eval(k.value) for k in device.keywords}
++        if props.get('type') != 'cuda' or props.get('cc') != 90 or props.get('warp_size') != 32:
++            return source, False
++        expected_args = ast.parse('def f(in_ptr0, in_ptr1, in_ptr2, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr): pass').body[0].args
++        if ast.dump(fn.args) != ast.dump(expected_args):
++            return source, False
++        body = copy.deepcopy(fn.body)
++        if not (isinstance(body[0], ast.Assign) and len(body[0].targets) == 1
++                and ast.unparse(body[0].targets[0]) == 'xnumel'):
++            return source, False
++        rows = ast.literal_eval(body[0].value)
++        if type(rows) is not int or rows <= 0 or rows % 4 or rows > hints['x']:
++            return source, False
++        body[0].value = ast.Constant(0)
++        if ast.dump(ast.Module(body=body, type_ignores=[])) != _BODY_AST:
++            return source, False
++        from torch._inductor import config
++        if config.autotune_lookup_table:
++            return source, False
++        # Preserve every byte of the body and every original decorator argument.
++        lines = source.splitlines(keepends=True)
++        node = dec.func
++        begin = sum(map(len, lines[:node.lineno - 1])) + node.col_offset
++        end = sum(map(len, lines[:node.end_lineno - 1])) + node.end_col_offset
++        replacement = 'nanochat_norm_rowpack.persistent_reduction'
++        rewritten = source[:begin] + replacement + source[end:]
++        version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++        prefix = (f'# nanochat_norm_rowpack_source={version}\n'
++                  'from nanochat import norm_rowpack as nanochat_norm_rowpack\n')
++        return prefix + rewritten, True
++    except (SyntaxError, ValueError, TypeError, KeyError, IndexError):
++        return source, False
++
++
++def persistent_reduction(size_hints, reduction_hint=False, triton_meta=None,
++                         filename=None, inductor_meta=None):
++    from torch._inductor import config
++    from torch._inductor.runtime import triton_heuristics as h
++    from torch._inductor.runtime.hints import ReductionHint
++    import triton
++
++    meta = {} if inductor_meta is None else dict(inductor_meta)
++    meta['reduction_hint'] = reduction_hint
++    configs = h._persistent_reduction_configs(size_hints, reduction_hint, meta)
++    baseline = triton.Config({'XBLOCK': 1}, num_warps=2, num_stages=1)
++    baseline.dynamic_scale_rblock = True
++    if (not _metadata_ok(meta) or config.autotune_lookup_table
++            or reduction_hint != ReductionHint.INNER
++            or len(configs) != 1 or configs[0].__dict__ != baseline.__dict__):
++        print('NANOCHAT_OPT_NORM_ROWPACK: stock configuration fallback', flush=True)
++        return h.persistent_reduction(size_hints, reduction_hint, triton_meta,
++                                      filename, inductor_meta)
++    packed = copy.deepcopy(configs[0])
++    # Triton Config.__setstate__ omits dynamically attached fields on deepcopy.
++    packed.__dict__ = copy.deepcopy(configs[0].__dict__)
++    packed.kwargs['XBLOCK'] = 4
++    packed.num_warps = 8
++    print(f'NANOCHAT_OPT_NORM_ROWPACK: {meta.get("kernel_name")} XBLOCK=4 warps=8', flush=True)
++    return h.cached_autotune(size_hints, [packed], triton_meta=triton_meta,
++                            inductor_meta=meta, filename=filename,
++                            heuristic_type=h.HeuristicType.PERSISTENT_REDUCTION)
++
++
++def enable():
++    import torch.compiler.config as compiler_config
++    from torch._inductor import config
++    from torch._inductor.async_compile import AsyncCompile
++    from torch._inductor.virtualized import V
++
++    def supported():
++        if config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation:
++            raise RuntimeError('norm row packing supports ordinary Python JIT only')
++
++    supported()
++    original = AsyncCompile.triton
++    if getattr(original, '_nanochat_split_scale', False):
++        raise RuntimeError('install norm row packing before scale splitting')
++    if getattr(original, '_nanochat_norm_rowpack', False):
++        raise RuntimeError('install norm row packing only once')
++    compiler_config.cache_key_tag += ':nanochat-norm-rowpack-' + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++
++    @functools.wraps(original)
++    def compile_triton(self, kernel_name, source_code, device_str='cuda'):
++        supported()
++        rewritten, matched = rewrite(source_code, kernel_name) if device_str == 'cuda' else (source_code, False)
++        if matched:
++            print(f'NANOCHAT_OPT_NORM_ROWPACK: rewrite {kernel_name}', flush=True)
++        return original(self, kernel_name, rewritten, device_str)
++
++    compile_triton._nanochat_norm_rowpack = True
++    AsyncCompile.triton = compile_triton
+diff --git a/nanochat/persistent_scale_split.py b/nanochat/persistent_scale_split.py
+new file mode 100644
+index 0000000..84d9b24
+--- /dev/null
++++ b/nanochat/persistent_scale_split.py
+@@ -0,0 +1,301 @@
++"""Extract the singleton FP64 scale from one exact persistent reduction.
++
++The main reduction, gating math and writes stay intact. The original kernel is
++retained for unsupported runtime layouts, aliases or streams. N1 validation is
++required; moving this chain can alter compiler scheduling and rounding.
++"""
++import ast
++import atexit
++import copy
++import functools
++import hashlib
++import json
++import os
++from collections import Counter
++from pathlib import Path
++
++from nanochat import scalar_scale_split as split
++
++# Full captured source selector, with only kernel name, rank and backend hash
++# normalized. Constants here describe generated code; they replace no data.
++_EXPECTED = r"""
++import triton
++import triton.language as tl
++from torch._inductor.runtime import triton_helpers, triton_heuristics
++from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
++from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
++triton_helpers.set_driver_to_gpu()
++
++@triton_heuristics.persistent_reduction(size_hints={'x': 524288, 'r0_': 128}, reduction_hint=ReductionHint.INNER, filename=__file__, triton_meta={'signature': {'in_out_ptr0': '*bf16', 'in_ptr0': '*bf16', 'in_ptr1': '*bf16', 'in_ptr2': '*fp32', 'in_ptr3': '*i64', 'in_ptr4': '*bf16', 'out_ptr0': '*fp8e5', 'out_ptr1': '*fp32', 'xnumel': 'i32', 'r0_numel': 'i32', 'XBLOCK': 'constexpr'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=78, cc=90, major=9, regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048, warp_size=32), 'constants': {}, 'configs': [{(0,): [['tt.divisibility', 16]], (1,): [['tt.divisibility', 16]], (2,): [['tt.divisibility', 16]], (3,): [['tt.divisibility', 16]], (4,): [['tt.divisibility', 16]], (5,): [['tt.divisibility', 16]], (6,): [['tt.divisibility', 16]], (7,): [['tt.divisibility', 16]], (8,): [['tt.divisibility', 16]], (9,): [['tt.divisibility', 16]]}]}, inductor_meta={'grid_type': 'Grid1D', 'autotune_hints': set(), 'kernel_name': '_kernel', 'mutated_arg_names': ['in_out_ptr0'], 'optimize_mem': True, 'no_x_dim': None, 'num_load': 6, 'num_reduction': 1, 'backend_hash': '_backend', 'are_deterministic_algorithms_enabled': True, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False, 'tiling_scores': {'x': 2359296, 'r0_': 805306368}})
++@triton.jit
++def _kernel(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK: tl.constexpr):
++    xnumel = 393216
++    r0_numel = 128
++    R0_BLOCK: tl.constexpr = 128
++    rnumel = r0_numel
++    RBLOCK: tl.constexpr = R0_BLOCK
++    xoffset = tl.program_id(0) * XBLOCK
++    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
++    xmask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
++    r0_index = tl.arange(0, R0_BLOCK)[None, :]
++    r0_offset = 0
++    r0_mask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
++    roffset = r0_offset
++    rindex = r0_index
++    r0_1 = r0_index
++    x0 = xindex
++    x3 = xindex // 12
++    tmp0 = tl.load(in_ptr0 + (r0_1 + 128 * x0), None).to(tl.float32)
++    tmp1 = tl.load(in_ptr1 + (r0_1 + 128 * x0), None).to(tl.float32)
++    tmp7 = tl.load(in_ptr2 + 0)
++    tmp8 = tl.broadcast_to(tmp7, [XBLOCK, R0_BLOCK])
++    tmp23 = tl.load(in_ptr3 + x3, None, eviction_policy='evict_last')
++    tmp26 = tl.load(in_ptr4 + x0, None).to(tl.float32)
++    tmp36 = tl.load(in_ptr4 + x0, None, eviction_policy='evict_last').to(tl.float32)
++    tmp2 = tmp0 * tmp1
++    tmp3 = tl.broadcast_to(tmp2, [XBLOCK, R0_BLOCK])
++    tmp5 = tl.sum(tmp3, 1)[:, None].to(tl.float32)
++    tmp6 = tmp0.to(tl.float32)
++    tmp9 = tmp8.to(tl.float64)
++    tmp10 = tl.full([1, 1], 1e-12, tl.float64)
++    tmp11 = triton_helpers.maximum(tmp9, tmp10)
++    tmp12 = tl.full([1, 1], 1, tl.int32)
++    tmp13 = tmp12 / tmp11
++    tmp14 = tl.full([1, 1], 57344.0, tl.float64)
++    tmp15 = tmp13 * tmp14
++    tmp16 = tmp15.to(tl.float32)
++    tmp17 = tmp6 * tmp16
++    tmp18 = -57344.0
++    tmp19 = triton_helpers.maximum(tmp17, tmp18)
++    tmp20 = 57344.0
++    tmp21 = triton_helpers.minimum(tmp19, tmp20)
++    tmp22 = tmp21.to(tl.float8e5)
++    tmp24 = tl.full([1, 1], -1, tl.int64)
++    tmp25 = tmp23 == tmp24
++    tmp27 = tl.sigmoid(tmp26)
++    tmp28 = 3.0
++    tmp29 = tmp27 * tmp28
++    tmp30 = tmp0 * tmp29
++    tmp31 = tmp30.to(tl.float32)
++    tmp32 = 0.0
++    tmp33 = tl.where(tmp25, tmp32, tmp31)
++    tmp34 = tmp5 * tmp28
++    tmp35 = tmp34.to(tl.float32)
++    tmp37 = tl.sigmoid(tmp36)
++    tmp38 = tmp37.to(tl.float32)
++    tmp39 = 1.0
++    tmp40 = tmp39 - tmp38
++    tmp41 = tmp38 * tmp40
++    tmp42 = tmp35 * tmp41
++    tmp43 = tmp42.to(tl.float32)
++    tl.store(out_ptr0 + (r0_1 + 128 * x0), tmp22, None)
++    tl.store(out_ptr1 + (r0_1 + 128 * x0), tmp33, None)
++    tl.debug_barrier()
++    tl.store(in_out_ptr0 + x0, tmp43, None)
++"""
++_EXPECTED_AST = ast.dump(ast.parse(_EXPECTED))
++
++
++def split_source(source, kernel_name):
++    """Accept the captured AST only; never execute generated source to inspect it."""
++    if 'triton_heuristics.persistent_reduction' not in source or '_nanochat_' in source:
++        return None
++    try:
++        tree = ast.parse(source)
++        normalized = copy.deepcopy(tree)
++        funcs = [n for n in normalized.body if isinstance(n, ast.FunctionDef)]
++        if len(funcs) != 1 or funcs[0].name != kernel_name:
++            return None
++        fn = funcs[0]
++        fn.name = '_kernel'
++        dec = fn.decorator_list[0]
++        kw = {k.arg: k.value for k in dec.keywords}
++        if len(kw) != len(dec.keywords):
++            return None
++        meta = split._fields(kw['triton_meta'])
++        device = meta['device']
++        props = {k.arg: ast.literal_eval(k.value) for k in device.keywords}
++        if (len(props) != len(device.keywords) or type(props.get('index')) is not int
++                or not 0 <= props['index'] < 8):
++            return None
++        next(k for k in device.keywords if k.arg == 'index').value = ast.Constant(0)
++        imeta = split._fields(kw['inductor_meta'])
++        if (ast.literal_eval(imeta['kernel_name']) != kernel_name
++                or not isinstance(ast.literal_eval(imeta['backend_hash']), str)):
++            return None
++        imeta['kernel_name'].value = '_kernel'
++        imeta['backend_hash'].value = '_backend'
++        if ast.dump(normalized) != _EXPECTED_AST:
++            return None
++        from torch._inductor import config
++        if config.autotune_lookup_table or config.coordinate_descent_tuning:
++            return None
++    except (SyntaxError, ValueError, TypeError, KeyError, IndexError, AttributeError, StopIteration):
++        return None
++
++    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
++    scalar_tree = copy.deepcopy(tree)
++    scalar_fn = next(n for n in scalar_tree.body if isinstance(n, ast.FunctionDef))
++    scalar_name = kernel_name + '_nanochat_persistent_scale'
++    scalar_fn.name = scalar_name
++    scalar_fn.args = ast.parse(
++        'def f(in_ptr2, _nanochat_scale_out, xnumel, XBLOCK: tl.constexpr): pass'
++    ).body[0].args
++    selected = {'tmp7', 'tmp8', *(f'tmp{i}' for i in range(9, 17))}
++    scalar_fn.body = [n for n in scalar_fn.body if isinstance(n, ast.Assign)
++                      and n.targets[0].id in selected]
++    scalar_fn.body[1].value = split._expr('tmp7')  # Broadcast only after the FP32 cast.
++    scalar_fn.body.append(ast.parse(
++        'tl.store(_nanochat_scale_out + tl.full([1], 0, tl.int32), tl.reshape(tmp16, [1]))'
++    ).body[0])
++    scalar_dec = scalar_fn.decorator_list[0]
++    scalar_kw = {k.arg: k.value for k in scalar_dec.keywords}
++    scalar_tm = split._fields(scalar_kw['triton_meta'])
++    scalar_tm['signature'] = split._expr(repr({
++        'in_ptr2': '*fp32', '_nanochat_scale_out': '*fp32', 'xnumel': 'i32', 'XBLOCK': 'constexpr'
++    }))
++    scalar_tm['configs'] = split._expr('[{}]')
++    scalar_im = split._fields(scalar_kw['inductor_meta'])
++    scalar_im.update({k: split._expr(repr(v)) for k, v in {
++        'kernel_name': scalar_name, 'mutated_arg_names': [], 'optimize_mem': False,
++        'num_load': 1, 'num_reduction': 0,
++    }.items()})
++    for key in ('no_x_dim', 'tiling_scores', 'dynamic_scale_rblock', 'min_split_scan_rblock'):
++        scalar_im.pop(key)
++    scalar_dec.func = split._expr('triton_heuristics.pointwise')
++    scalar_dec.keywords = [ast.keyword(arg=k, value=v) for k, v in {
++        'size_hints': split._expr("{'x': 1}"), 'filename': split._expr('__file__'),
++        'triton_meta': split._dictionary(scalar_tm),
++        'inductor_meta': split._dictionary(scalar_im), 'min_elem_per_thread': ast.Constant(0)
++    }.items()]
++
++    # Keep the ten original runtime positions and every existing config index.
++    fn.args.args.insert(10, ast.arg(arg='_nanochat_scale_input'))
++    dec = fn.decorator_list[0]
++    kw = {k.arg: k.value for k in dec.keywords}
++    tm = split._fields(kw['triton_meta'])
++    signature = split._fields(tm['signature'])
++    signature = {**{k: v for k, v in signature.items() if k != 'XBLOCK'},
++                 '_nanochat_scale_input': ast.Constant('*fp32'), 'XBLOCK': signature['XBLOCK']}
++    tm['signature'] = split._dictionary(signature)
++    kw['triton_meta'] = split._dictionary(tm)
++    dec.keywords = [ast.keyword(arg=k, value=v) for k, v in kw.items()]
++    # Replace one scalar load and its chain; retain all other statements, including
++    # constexpr AnnAssigns, FP32 sum, sigmoid, barrier and the three writes.
++    fn.body = [n for n in fn.body if not (isinstance(n, ast.Assign)
++               and n.targets[0].id in {f'tmp{i}' for i in range(9, 16)})]
++    for n in fn.body:
++        if isinstance(n, ast.Assign) and n.targets[0].id == 'tmp7':
++            n.value = split._expr('tl.load(_nanochat_scale_input + 0)')
++        elif isinstance(n, ast.Assign) and n.targets[0].id == 'tmp16':
++            n.value = split._expr('tmp8')
++    identity = hashlib.sha256(Path(__file__).read_bytes() + Path(split.__file__).read_bytes()).hexdigest()
++    prefix = f'# nanochat_persistent_scale_helpers={identity}\n'
++    large = prefix + ast.unparse(ast.fix_missing_locations(tree)) + '\n'
++    scalar = prefix + ast.unparse(ast.fix_missing_locations(scalar_tree)) + '\n'
++    return split.SplitSource(large, scalar, scalar_name, 3, 10)
++
++
++def _runtime_reason(args, stream, kwargs):
++    import torch
++    if kwargs or len(args) != 10:
++        return 'run_abi'
++    if (type(args[8]) is not int or type(args[9]) is not int
++            or args[8:] != (393216, 128)):
++        return 'extents'
++    source = args[3]
++    tensors = [(source, torch.float32, 1), (args[0], torch.bfloat16, 393216),
++               (args[6], torch.float8_e5m2, 50331648), (args[7], torch.float32, 50331648)]
++    for tensor, dtype, numel in tensors:
++        if (type(tensor) is not torch.Tensor or not tensor.is_cuda or tensor.layout != torch.strided
++                or tensor.dtype != dtype or tensor.numel() != numel or not tensor.is_contiguous()
++                or tensor.is_conj() or tensor.is_neg()):
++            return 'tensor_layout'
++        if tensor.device != source.device:
++            return 'device'
++    if (torch.cuda.current_device() != source.device.index
++            or torch.cuda.current_stream(source.device).cuda_stream != stream):
++        return 'stream'
++    if torch.cuda.is_current_stream_capturing():
++        return 'capture'
++    lo = source.data_ptr()
++    for tensor, _, numel in tensors[1:]:
++        start = tensor.data_ptr()
++        if lo < start + numel * tensor.element_size() and start < lo + 4:
++            return 'source_output_alias'
++    return None
++
++
++_COUNTS = Counter()
++
++
++class _GuardedKernel:
++    def __init__(self, baseline, large, scalar, plan):
++        self.baseline = baseline
++        self.split = split._SplitKernel(large, scalar, plan)
++
++    def run(self, *args, stream, **kwargs):
++        reason = _runtime_reason(args, stream, kwargs)
++        if reason is not None:
++            _COUNTS['fallback_' + reason] += 1
++            return self.baseline.run(*args, stream=stream, **kwargs)
++        # No retry after either child has executed. Allocation ownership and
++        # current-stream ordering are supplied by the existing validated wrapper.
++        _COUNTS['fast'] += 1
++        return self.split.run(*args, stream=stream)
++
++
++def _combine(baseline, large, scalar, plan, future_types, make_future):
++    def resolve(value):
++        return value.result() if isinstance(value, future_types) else value
++    def result():
++        return _GuardedKernel(resolve(baseline), resolve(large), resolve(scalar), plan)
++    return make_future(result) if any(isinstance(v, future_types)
++                                     for v in (baseline, large, scalar)) else result()
++
++
++def enable():
++    from concurrent.futures import Future
++    import torch.compiler.config as compiler_config
++    from torch._inductor import config
++    from torch._inductor.async_compile import AsyncCompile
++    from torch._inductor.codecache import CodeCacheFuture, LambdaFuture
++    from torch._inductor.virtualized import V
++
++    def supported():
++        if (config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation
++                or config.triton.cudagraphs or config.triton.multi_kernel):
++            raise RuntimeError('persistent scale split requires ordinary uncaptured Python JIT')
++    supported()
++    original = AsyncCompile.triton
++    if (getattr(original, '_nanochat_persistent_scale', False)
++            or getattr(original, '_nanochat_split_scale', False)):
++        raise RuntimeError('install persistent scale once, before pointwise split scale')
++    identity = hashlib.sha256(Path(__file__).read_bytes() + Path(split.__file__).read_bytes()).hexdigest()
++    compiler_config.cache_key_tag += ':nanochat-persistent-scale-' + identity
++
++    @functools.wraps(original)
++    def compile_triton(self, kernel_name, source_code, device_str='cuda'):
++        supported()
++        plan = split_source(source_code, kernel_name) if device_str == 'cuda' else None
++        if plan is None:
++            return original(self, kernel_name, source_code, device_str)
++        _COUNTS['matched'] += 1
++        print('NANOCHAT_OPT_PERSISTENT_SCALE_SPLIT: ' + json.dumps({
++            'rank': os.environ.get('RANK'), 'kernel': kernel_name,
++            'original': hashlib.sha256(source_code.encode()).hexdigest(),
++            'large': hashlib.sha256(plan.large_source.encode()).hexdigest(),
++            'scalar': hashlib.sha256(plan.scalar_source.encode()).hexdigest(), 'helpers': identity
++        }, sort_keys=True), flush=True)
++        baseline = original(self, kernel_name, source_code, device_str)
++        large = original(self, kernel_name, plan.large_source, device_str)
++        scalar = original(self, plan.scalar_name, plan.scalar_source, device_str)
++        return _combine(baseline, large, scalar, plan, (Future, CodeCacheFuture), LambdaFuture)
++
++    compile_triton._nanochat_persistent_scale = True
++    AsyncCompile.triton = compile_triton
++    def report():
++        print('NANOCHAT_OPT_PERSISTENT_SCALE_COUNTERS: ' + json.dumps({
++            'pid': os.getpid(), 'rank': os.environ.get('RANK'), **_COUNTS
++        }, sort_keys=True), flush=True)
++    atexit.register(report)
+diff --git a/nanochat/scalar_scale_split.py b/nanochat/scalar_scale_split.py
+new file mode 100644
+index 0000000..0daaabd
+--- /dev/null
++++ b/nanochat/scalar_scale_split.py
+@@ -0,0 +1,417 @@
++"""Extract singleton FP8 scale calculations after graph fusion, on one stream.
++
++Original arithmetic and autograd stay intact; frozen N1 validation is required.
++"""
++
++import ast
++import copy
++import functools
++import hashlib
++from dataclasses import dataclass
++from pathlib import Path
++
++
++def _name(node):
++    return ast.unparse(node)
++
++
++def _numeric(node):
++    if isinstance(node, ast.Constant):
++        return type(node.value) in (int, float)
++    return (isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd))
++            and _numeric(node.operand))
++
++
++def _constant_rank(node, definitions):
++    if _numeric(node):
++        return 0
++    if isinstance(node, ast.Name):
++        definition = definitions.get(node.id)
++        if definition is None:
++            return None
++        value = definition.value
++        if _numeric(value):
++            return 0
++        if (isinstance(value, ast.Call) and _name(value.func) == "tl.full"
++                and len(value.args) == 3 and not value.keywords
++                and isinstance(value.args[0], (ast.List, ast.Tuple))
++                and all(isinstance(x, ast.Constant) and type(x.value) is int and x.value == 1
++                        for x in value.args[0].elts)
++                and _numeric(value.args[1])
++                and _name(value.args[2]) in {"tl.float64", "tl.float32", "tl.int32", "tl.int64"}):
++            return len(value.args[0].elts)
++    return None
++
++
++def _cast_of(node, source, dtype):
++    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
++            and isinstance(node.func.value, ast.Name) and node.func.value.id == source
++            and node.func.attr == "to" and len(node.args) == 1 and not node.keywords
++            and _name(node.args[0]) == dtype)
++
++
++def _delay_source(source, kernel_name):
++    """Return unchanged bytes on a miss; never import or execute the source."""
++    if "tl.float64" not in source or not any(x in source for x in ("tl.float8e5", "tl.float8e4nv")):
++        return source, 0
++    tree = ast.parse(source)
++    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == kernel_name]
++    if len(functions) != 1:
++        return source, 0
++    fn = functions[0]
++    if not any(isinstance(d, ast.Call) and _name(d.func) == "triton_heuristics.pointwise"
++               for d in fn.decorator_list):
++        return source, 0
++    if any(not isinstance(n, (ast.Assign, ast.Expr)) for n in fn.body):
++        return source, 0
++    if any(isinstance(n, ast.NamedExpr) for statement in fn.body for n in ast.walk(statement)):
++        return source, 0
++
++    definitions, uses, duplicates = {}, {}, set()
++    for statement in fn.body:
++        if isinstance(statement, ast.Assign):
++            if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
++                return source, 0
++            name = statement.targets[0].id
++            if name in definitions:
++                duplicates.add(name)
++            definitions[name] = statement
++        for node in ast.walk(statement.value):
++            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
++                uses.setdefault(node.id, []).append(statement)
++    if duplicates:
++        return source, 0
++
++    arguments = {a.arg for a in fn.args.args}
++    constexprs = {a.arg for a in fn.args.args
++                  if a.annotation is not None and _name(a.annotation) == "tl.constexpr"}
++
++    def owns_line(statement):
++        return (statement.lineno == statement.end_lineno
++                and all(other is statement or not (other.lineno <= statement.lineno <= other.end_lineno)
++                        for other in fn.body))
++
++    lines, edits, occupied = source.splitlines(keepends=True), {}, set()
++    matches = 0
++    for name, broadcast in definitions.items():
++        call = broadcast.value
++        if (not isinstance(call, ast.Call) or _name(call.func) != "tl.broadcast_to"
++                or len(call.args) != 2 or call.keywords
++                or not isinstance(call.args[0], ast.Name)
++                or not isinstance(call.args[1], (ast.List, ast.Tuple))):
++            continue
++        rank = len(call.args[1].elts)
++        if rank == 0 or not all(
++                (isinstance(d, ast.Constant) and type(d.value) is int and d.value > 0)
++                or (isinstance(d, ast.Name) and d.id in constexprs and d.id not in definitions)
++                for d in call.args[1].elts):
++            continue
++        load = definitions.get(call.args[0].id)
++        if (load is None or not isinstance(load.value, ast.Call)
++                or _name(load.value.func) != "tl.load" or len(load.value.args) != 1
++                or load.value.keywords):
++            continue
++        pointer = load.value.args[0]
++        if not (isinstance(pointer, ast.BinOp) and isinstance(pointer.op, ast.Add)
++                and isinstance(pointer.left, ast.Name) and pointer.left.id in arguments
++                and pointer.left.id not in definitions
++                and isinstance(pointer.right, ast.Constant) and type(pointer.right.value) is int):
++            continue
++        consumers = uses.get(name, [])
++        if len(consumers) != 1 or not isinstance(consumers[0], ast.Assign):
++            continue
++        first = consumers[0]
++        if not _cast_of(first.value, name, "tl.float64"):
++            continue
++
++        current, singleton_rank = first.targets[0].id, 0
++        chain, terminal, has_division = {name, current}, None, False
++        while True:
++            consumers = uses.get(current, [])
++            if len(consumers) != 1 or not isinstance(consumers[0], ast.Assign):
++                break
++            statement = consumers[0]
++            if _cast_of(statement.value, current, "tl.float32"):
++                terminal = statement
++                break
++            expression = statement.value
++            operands = None
++            if isinstance(expression, ast.BinOp) and isinstance(expression.op, (ast.Mult, ast.Div)):
++                operands = (expression.left, expression.right)
++                has_division |= isinstance(expression.op, ast.Div)
++            elif (isinstance(expression, ast.Call)
++                  and _name(expression.func) in {"triton_helpers.maximum", "triton_helpers.minimum"}
++                  and len(expression.args) == 2 and not expression.keywords):
++                operands = expression.args
++            if operands is None:
++                break
++            other = [x for x in operands if not (isinstance(x, ast.Name) and x.id == current)]
++            if len(other) != 1:
++                break
++            other_rank = _constant_rank(other[0], definitions)
++            if other_rank is None or (singleton_rank and other_rank and singleton_rank != other_rank):
++                break
++            singleton_rank = max(singleton_rank, other_rank)
++            current = statement.targets[0].id
++            if current in chain:
++                break
++            chain.add(current)
++        if (terminal is None or not has_division or singleton_rank not in (0, rank)
++                or chain & occupied or not owns_line(broadcast) or not owns_line(terminal)):
++            continue
++        output = terminal.targets[0].id
++        temporary = "_nanochat_singleton_" + output
++        if temporary in definitions or temporary in arguments or temporary in uses:
++            continue
++        indent = " " * broadcast.col_offset
++        edits[broadcast.lineno - 1] = indent + name + " = " + call.args[0].id + "\n"
++        indent = " " * terminal.col_offset
++        edits[terminal.lineno - 1] = (
++            indent + temporary + " = " + _name(terminal.value) + "\n"
++            + indent + output + " = tl.broadcast_to(" + temporary + ", "
++            + _name(call.args[1]) + ")\n")
++        occupied.update(chain | {output})
++        matches += 1
++    if not matches:
++        return source, 0
++    result = "".join(edits.get(i, line) for i, line in enumerate(lines))
++    ast.parse(result)
++    return result, matches
++
++
++def _fields(node):
++    if not isinstance(node, ast.Dict) or any(
++            not isinstance(k, ast.Constant) or not isinstance(k.value, str)
++            for k in node.keys):
++        return None
++    keys = [k.value for k in node.keys]
++    if len(set(keys)) != len(keys):
++        return None
++    return dict(zip(keys, node.values))
++
++
++def _dictionary(fields):
++    return ast.Dict(keys=[ast.Constant(k) for k in fields], values=list(fields.values()))
++
++
++def _expr(text):
++    return ast.parse(text, mode="eval").body
++
++
++@dataclass(frozen=True)
++class SplitSource:
++    large_source: str
++    scalar_source: str
++    scalar_name: str
++    input_index: int
++    runtime_args: int
++
++
++def split_source(source, kernel_name):
++    """Extract one proven singleton chain, or return None without executing source."""
++    if "_nanochat_" in source:
++        return None
++    delayed, count = _delay_source(source, kernel_name)
++    if count != 1:
++        return None
++    tree = ast.parse(delayed)
++    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
++    if len(functions) != 1:
++        return None
++    fn = functions[0]
++    if (fn.args.posonlyargs or fn.args.kwonlyargs or fn.args.vararg or fn.args.kwarg
++            or fn.args.defaults):
++        return None
++    args = fn.args.args
++    names = [a.arg for a in args]
++    runtime = [a for a in args if a.annotation is None]
++    constexprs = args[len(runtime):]
++    if args[:len(runtime)] != runtime or any(
++            a.annotation is None or _name(a.annotation) != "tl.constexpr" for a in constexprs):
++        return None
++    pointwise = next(d for d in fn.decorator_list
++                     if isinstance(d, ast.Call) and _name(d.func) == "triton_heuristics.pointwise")
++    keywords = {k.arg: k.value for k in pointwise.keywords}
++    if pointwise.args or len(keywords) != len(pointwise.keywords):
++        return None
++    meta = _fields(keywords.get("triton_meta"))
++    imeta = _fields(keywords.get("inductor_meta"))
++    if meta is None or imeta is None:
++        return None
++    signature = _fields(meta.get("signature"))
++    if signature is None or list(signature) != names:
++        return None
++    if _fields(meta.get("constants")) != {}:
++        return None
++    if "extra_launcher_args" in imeta and ast.literal_eval(imeta["extra_launcher_args"]):
++        return None
++    configs = meta.get("configs")
++    if not isinstance(configs, ast.List) or not configs.elts:
++        return None
++    for cfg in configs.elts:
++        if not isinstance(cfg, ast.Dict):
++            return None
++        for key in cfg.keys:
++            index = ast.literal_eval(key)
++            if (not isinstance(index, tuple) or len(index) != 1
++                    or type(index[0]) is not int or not 0 <= index[0] < len(runtime)):
++                return None
++
++    definitions = {n.targets[0].id: n for n in fn.body if isinstance(n, ast.Assign)}
++    terminals = [n for name, n in definitions.items() if name.startswith("_nanochat_singleton_")]
++    if len(terminals) != 1:
++        return None
++    terminal = terminals[0]
++    selected = set()
++
++    def dependencies(statement):
++        name = statement.targets[0].id
++        if name in selected:
++            return
++        selected.add(name)
++        for node in ast.walk(statement.value):
++            if isinstance(node, ast.Name) and node.id in definitions:
++                dependencies(definitions[node.id])
++
++    dependencies(terminal)
++    body = [n for n in fn.body if isinstance(n, ast.Assign) and n.targets[0].id in selected]
++    loads = [n for n in body if isinstance(n.value, ast.Call) and _name(n.value.func) == "tl.load"]
++    if len(loads) != 1:
++        return None
++    load = loads[0]
++    pointer = load.value.args[0].left.id
++    if pointer not in names[:len(runtime)] or _name(signature[pointer]) != repr("*fp32"):
++        return None
++    # Moving the read ahead of the original kernel must not cross a memory write
++    # or an opaque operation. These are the pure address/load operations emitted
++    # before scalar loads in the supported Inductor pointwise path.
++    pure = {"tl.load", "tl.full", "tl.program_id", "tl.arange", "tl.broadcast_to"}
++    for statement in fn.body:
++        if statement.lineno > load.lineno:
++            break
++        for call in (n for n in ast.walk(statement) if isinstance(n, ast.Call)):
++            if _name(call.func) in pure:
++                continue
++            if isinstance(call.func, ast.Attribute) and call.func.attr == "to":
++                continue
++            return None
++    if "mutated_arg_names" not in imeta:
++        return None
++    if pointer in ast.literal_eval(imeta["mutated_arg_names"]):
++        return None
++
++    scalar_name = kernel_name + "_nanochat_scale"
++    out_name = "_nanochat_scale_out"
++    in_name = "_nanochat_scale_input"
++    scalar_fn = copy.deepcopy(fn)
++    scalar_fn.name = scalar_name
++    scalar_fn.args.args = [ast.arg(arg=pointer), ast.arg(arg=out_name), ast.arg(arg="xnumel"),
++                           ast.arg(arg="XBLOCK", annotation=_expr("tl.constexpr"))]
++    scalar_fn.body = copy.deepcopy(body)
++    result = terminal.targets[0].id
++    # A shape-only reshape gives the output pointer and value the same rank.
++    scalar_fn.body.append(ast.parse(f"tl.store({out_name} + tl.full([1], 0, tl.int32), tl.reshape({result}, [1]))").body[0])
++    scalar_meta = copy.deepcopy(meta)
++    scalar_meta["signature"] = _expr(repr({pointer: "*fp32", out_name: "*fp32", "xnumel": "i32", "XBLOCK": "constexpr"}))
++    scalar_meta["configs"] = _expr("[{}]")
++    scalar_imeta = copy.deepcopy(imeta)
++    scalar_imeta.update({"grid_type": ast.Constant("Grid1D"), "kernel_name": ast.Constant(scalar_name),
++                         "mutated_arg_names": _expr("[]"), "num_load": ast.Constant(1),
++                         "num_reduction": ast.Constant(0), "autotune_hints": _expr("set()")})
++    scalar_imeta.pop("tiling_scores", None)
++    scalar_keywords = copy.deepcopy(keywords)
++    scalar_keywords.update({"size_hints": _expr("{'x': 1}"), "triton_meta": _dictionary(scalar_meta),
++                            "inductor_meta": _dictionary(scalar_imeta), "min_elem_per_thread": ast.Constant(0)})
++    scalar_keywords.pop("tile_hint", None)
++    scalar_pointwise = next(d for d in scalar_fn.decorator_list
++                            if isinstance(d, ast.Call) and _name(d.func) == "triton_heuristics.pointwise")
++    scalar_pointwise.keywords = [ast.keyword(arg=k, value=v) for k, v in scalar_keywords.items()]
++    scalar_tree = copy.deepcopy(tree)
++    scalar_tree.body = [scalar_fn if isinstance(n, ast.FunctionDef) else n for n in scalar_tree.body]
++
++    # Existing runtime argument positions and their config indices stay intact.
++    fn.args.args.insert(len(runtime), ast.arg(arg=in_name))
++    large_signature = {a.arg: signature[a.arg] for a in runtime}
++    large_signature[in_name] = ast.Constant("*fp32")
++    large_signature.update({a.arg: signature[a.arg] for a in constexprs})
++    meta["signature"] = _dictionary(large_signature)
++    keywords["triton_meta"] = _dictionary(meta)
++    imeta["num_load"] = ast.Constant(ast.literal_eval(imeta["num_load"]) + 1)
++    keywords["inductor_meta"] = _dictionary(imeta)
++    pointwise.keywords = [ast.keyword(arg=k, value=v) for k, v in keywords.items()]
++    terminal.value = _expr(f"tl.load({in_name} + (0))")
++    large_source = ast.unparse(ast.fix_missing_locations(tree)) + "\n"
++    scalar_source = ast.unparse(ast.fix_missing_locations(scalar_tree)) + "\n"
++    ast.parse(large_source)
++    ast.parse(scalar_source)
++    return SplitSource(large_source, scalar_source, scalar_name, names.index(pointer), len(runtime))
++
++
++class _SplitKernel:
++    """Only the ordinary Python wrapper's run ABI is supported."""
++
++    def __init__(self, large, scalar, plan):
++        self.large = large
++        self.scalar = scalar
++        self.plan = plan
++
++    def run(self, *args, stream, **kwargs):
++        import torch
++
++        if kwargs or len(args) != self.plan.runtime_args:
++            raise RuntimeError("split scale requires the ordinary Python JIT run ABI")
++        source = args[self.plan.input_index]
++        if (not source.is_cuda or source.dtype != torch.float32
++                or torch.cuda.current_device() != source.device.index
++                or torch.cuda.current_stream(source.device).cuda_stream != stream):
++            raise RuntimeError("split scale requires FP32 input and matching current CUDA device/stream")
++        # Private allocation owned until both launches have been enqueued on its
++        # allocation stream. The ordinary caching allocator then preserves lifetime.
++        scale = torch.empty((), device=source.device, dtype=torch.float32)
++        self.scalar.run(source, scale, 1, stream=stream)
++        return self.large.run(*args, scale, stream=stream)
++
++
++def _combine(large, scalar, plan, future_types, make_future):
++    def resolve(value):
++        return value.result() if isinstance(value, future_types) else value
++
++    if isinstance(large, future_types) or isinstance(scalar, future_types):
++        return make_future(lambda: _SplitKernel(resolve(large), resolve(scalar), plan))
++    return _SplitKernel(large, scalar, plan)
++
++
++def enable():
++    from concurrent.futures import Future
++    import torch.compiler.config as compiler_config
++    from torch._inductor import config
++    from torch._inductor.async_compile import AsyncCompile
++    from torch._inductor.codecache import CodeCacheFuture, LambdaFuture
++    from torch._inductor.virtualized import V
++
++    def supported():
++        if config.cpp_wrapper or config.profile_bandwidth or V.aot_compilation:
++            raise RuntimeError("split scale supports ordinary Python JIT wrappers only")
++
++    supported()
++    original = AsyncCompile.triton
++    if getattr(original, "_nanochat_split_scale", False):
++        raise RuntimeError("split scale must be installed only once")
++    compiler_config.cache_key_tag += ":nanochat-split-scale-" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++
++    @functools.wraps(original)
++    def compile_triton(self, kernel_name, source_code, device_str="cuda"):
++        supported()
++        plan = split_source(source_code, kernel_name) if device_str == "cuda" else None
++        if plan is None:
++            return original(self, kernel_name, source_code, device_str)
++        print(f"NANOCHAT_OPT_SPLIT_SCALE: {kernel_name} input={plan.input_index} "
++              f"large={hashlib.sha256(plan.large_source.encode()).hexdigest()} "
++              f"scalar={hashlib.sha256(plan.scalar_source.encode()).hexdigest()}", flush=True)
++        large = original(self, kernel_name, plan.large_source, device_str)
++        scalar = original(self, plan.scalar_name, plan.scalar_source, device_str)
++        return _combine(large, scalar, plan, (Future, CodeCacheFuture), LambdaFuture)
++
++    compile_triton._nanochat_split_scale = True
++    AsyncCompile.triton = compile_triton
++

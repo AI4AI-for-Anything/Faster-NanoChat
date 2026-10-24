@@ -1,0 +1,93 @@
+{
+  "scope": "Accepted cumulative full-check checkpoints, not isolated ablations",
+  "rows": [
+    {
+      "round": 11,
+      "change": "FP8 scalar-scale extraction",
+      "speedup": 1.0364755545355848
+    },
+    {
+      "round": 15,
+      "change": "RMS backward row packing",
+      "speedup": 1.0406241013641975
+    },
+    {
+      "round": 16,
+      "change": "Row-maximum packing",
+      "speedup": 1.052250689401232
+    },
+    {
+      "round": 18,
+      "change": "Native backward FP8 GEMM selection",
+      "speedup": 1.0559014264656563
+    },
+    {
+      "round": 22,
+      "change": "Persistent reduction scale extraction",
+      "speedup": 1.0652243378002464
+    },
+    {
+      "round": 28,
+      "change": "MLP operand packing",
+      "speedup": 1.069926213032582
+    },
+    {
+      "round": 33,
+      "change": "Native value-embedding gradient accumulation",
+      "speedup": 1.071135994189386
+    },
+    {
+      "round": 43,
+      "change": "Packed MLP tile selection",
+      "speedup": 1.0739769465654325
+    }
+  ],
+  "benchmark": {
+    "speedup": 1.0743685863772128,
+    "timing": {
+      "reference-a": [
+        {
+          "seconds_per_step": 3.3584299087524414
+        },
+        {
+          "seconds_per_step": 3.3599581718444824
+        },
+        {
+          "seconds_per_step": 3.3591573238372803
+        }
+      ],
+      "candidate": [
+        {
+          "seconds_per_step": 3.12601375579834
+        },
+        {
+          "seconds_per_step": 3.1258225440979004
+        },
+        {
+          "seconds_per_step": 3.1262216567993164
+        }
+      ],
+      "reference-b": [
+        {
+          "seconds_per_step": 3.3568880558013916
+        },
+        {
+          "seconds_per_step": 3.3580429553985596
+        },
+        {
+          "seconds_per_step": 3.358271360397339
+        }
+      ]
+    }
+  },
+  "provenance": {
+    "upstream_commit": "92d63d4e8bb4df75c3b71618f31ddde2378b2bcd",
+    "retained_commit": "c46b67a6bf20de83039b38903252b9b4a133af09",
+    "source_digest": "b2b39bb6fb8d8528b9cc12844773205c0e4972b1cc3d1b7c8a4939b449edc8ba",
+    "final_check_sha256": "2729dcd865c25e95835b26a45b7eb924a18d637fd7e72a470ce5b22439fa4fea",
+    "status": "PASS",
+    "tier": "N1",
+    "full_training_run": false,
+    "bpb_core_evaluation_run": false
+  }
+}

@@ -1,0 +1,11 @@
+30	0	nanochat/fp8.py
+7	1	nanochat/gpt.py
+341	0	nanochat/lt_autotune.cpp
+149	0	nanochat/lt_autotune.py
+199	0	nanochat/max_rowpack.py
+206	0	nanochat/mlp_packed_layout.py
+231	0	nanochat/mlp_packed_tiles.py
+177	0	nanochat/native_value_embedding.py
+196	0	nanochat/norm_rowpack.py
+301	0	nanochat/persistent_scale_split.py
+417	0	nanochat/scalar_scale_split.py

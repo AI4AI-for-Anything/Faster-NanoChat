@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Source this file before launching Python; hooks install at import time.
+export NANOCHAT_OPT_SPLIT_SCALE=1
+export NANOCHAT_OPT_NORM_ROWPACK=1
+export NANOCHAT_OPT_MAX_ROWPACK=1
+export NANOCHAT_OPT_LT_SEARCH=1
+export NANOCHAT_OPT_PERSISTENT_SCALE_SPLIT=1
+export NANOCHAT_OPT_MLP_PACKED_LAYOUT=1
+export NANOCHAT_OPT_NATIVE_VALUE_EMBEDDING=1
+export NANOCHAT_OPT_MLP_PACKED_TILES=1
+export NANOCHAT_OPT_LT_BUILD_DIR="${NANOCHAT_OPT_LT_BUILD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/faster-nanochat/native}"
