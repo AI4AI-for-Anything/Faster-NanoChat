@@ -49,8 +49,8 @@ For other memory budgets, use the upstream interface, preserving the total token
 
 The historical benchmark protocol, measured windows and numerical gates are documented in [H20 results](h20-results.md). The compact [figure data](performance-views/history.json) binds those values to the original report hash and retained source commit.
 
-The original frozen judge, reference/candidate snapshots, binary numerical fixtures and deployment-specific replay scripts belong to the separate research archive. The source repository contains no copy of that environment. An exact historical replay requires that archive and its certified public assets; it is separate from running the portable pretraining entry point above. A different machine or software stack needs fresh measurement and numerical validation.
+The original frozen judge, baseline/candidate snapshots, binary numerical fixtures and deployment-specific replay scripts belong to the separate research archive. The source repository contains no copy of that environment. An exact historical replay requires that archive and its certified public assets; it is separate from running the portable pretraining entry point above. A different machine or software stack needs fresh measurement and numerical validation.
 
 ## Required quality follow-up
 
-Run complete reference and optimized training with identical certified data/tokenizer, recipe, seeds and evaluation settings. Then compare held-out BPB and CORE. Use upstream `scripts/base_eval.py` and the upstream evaluation assets. No weights or scored BPB/CORE results are included because these runs have not been performed.
+Run complete baseline and optimized training with identical certified data/tokenizer, recipe, seeds and evaluation settings. Then compare held-out BPB and CORE. Use upstream `scripts/base_eval.py` and the upstream evaluation assets. No weights or scored BPB/CORE results are included because these runs have not been performed.

@@ -1,6 +1,6 @@
 # Optimization history
 
-Fifty numbered exploration rounds produced eight retained implementation commits. Values below are cumulative original-reference full-check speedups, not independent ablations. Separately timed checkpoint differences also contain measurement variation.
+Fifty numbered exploration rounds produced eight retained implementation commits. Values below are cumulative original-baseline full-check speedups, not independent ablations. Separately timed checkpoint differences also contain measurement variation.
 
 | Round | Retained change | Cumulative speedup |
 |---|---|---:|
