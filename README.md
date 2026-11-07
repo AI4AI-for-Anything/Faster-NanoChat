@@ -49,6 +49,10 @@ See the [11-file change review](docs/change-views/files.md) and the exact [optim
 
 See the [H20 results and validation protocol](docs/h20-results.md) and [optimization history](docs/optimization-history.md).
 
+## TPU v6e (experimental)
+
+On 64 TPU v6e chips (16 hosts, torch_xla 2.9.0), Pallas splash attention makes a D24 training step **1.26× faster** than nanochat's SDPA fallback attention, from 252.2 to 200.3 ms per step. This was measured baseline-candidate-baseline at per-chip batch 2 (262,144 tokens per step), with FSDP over 64 chips, BF16 compute and synthetic data. It passes a 120-step paired-seed statistical gate. These numbers are not comparable to the H20 benchmark above, which uses a different global batch and FP8. See [TPU v6e results](docs/tpu-v6e-results.md) and the [`tpu_smoke/` harness](tpu_smoke/README.md).
+
 ## Upstream Nanochat documentation
 
 Based on [karpathy/nanochat](https://github.com/karpathy/nanochat), by Andrej Karpathy, pinned to `92d63d4e8bb4df75c3b71618f31ddde2378b2bcd`. [MIT license](LICENSE). An unchanged copy of the original README is also available in [README.upstream.md](README.upstream.md).
